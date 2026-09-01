@@ -6,6 +6,10 @@ python-docx==1.1.2
 arabic-reshaper==3.0.0
 python-bidi==0.6.3
 Pillow==11.0.0
+# Headless Chromium drives the reflowing HTML rebuild. Without it the
+# pipeline silently falls back to redrawing text at source coordinates,
+# which overlaps on dense pages.
+playwright==1.62.0
 passlib[bcrypt]==1.7.4
 bcrypt==4.0.1
 itsdangerous==2.2.0

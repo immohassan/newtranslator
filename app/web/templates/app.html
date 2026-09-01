@@ -1,0 +1,152 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Document Translator</title>
+<link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <div class="brand-mark">ع</div>
+      <div>
+        <h1>Document Translator</h1>
+        <p class="muted" id="provider-line">English ⇄ Arabic</p>
+      </div>
+    </div>
+    <div class="topbar-right">
+      <span class="muted" id="user-line"></span>
+      <button id="logout" class="ghost">Log out</button>
+    </div>
+  </header>
+
+  <div id="toasts" class="toasts" aria-live="polite"></div>
+
+  <main class="wrap">
+    <!-- 1. Upload -->
+    <section id="view-upload" class="card">
+      <h2>Translate a document</h2>
+      <p class="muted">PDF and DOCX files come back in the same format, with the
+         original layout, images and styling preserved.</p>
+
+      <div id="dropzone" class="dropzone" tabindex="0" role="button"
+           aria-label="Choose a file or drop one here">
+        <svg viewBox="0 0 24 24" class="dz-icon" aria-hidden="true">
+          <path d="M12 16V4m0 0L8 8m4-4 4 4M4 16v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2"
+                fill="none" stroke="currentColor" stroke-width="1.7"
+                stroke-linecap="round" stroke-linejoin="round"/>
+        </svg>
+        <p class="dz-main">Drop a file here, or <span class="link">browse</span></p>
+        <p class="muted small">PDF or DOCX · up to 50 MB</p>
+        <input type="file" id="file-input" accept=".pdf,.docx" hidden>
+      </div>
+
+      <div id="file-chip" class="file-chip" hidden>
+        <span id="file-name"></span>
+        <button id="file-clear" class="ghost small" aria-label="Remove file">✕</button>
+      </div>
+
+      <div class="options">
+        <div class="option-group">
+          <span class="option-label">Direction</span>
+          <div class="segmented" role="radiogroup" aria-label="Translation direction">
+            <button class="seg active" data-direction="en2ar" role="radio"
+                    aria-checked="true">English → Arabic</button>
+            <button class="seg" data-direction="ar2en" role="radio"
+                    aria-checked="false">Arabic → English</button>
+          </div>
+        </div>
+
+        <label class="switch-row">
+          <input type="checkbox" id="opt-html" checked>
+          <span>
+            <strong>Re-flow the layout</strong>
+            <span class="muted small">Rebuild the page so translated text that
+              needs more room pushes what follows it down. Turn this off to
+              redraw text at its original coordinates instead — faster, but a
+              dense page will overlap where the translation grew.</span>
+          </span>
+        </label>
+
+        <label class="switch-row">
+          <input type="checkbox" id="opt-mirror" checked>
+          <span>
+            <strong>Mirror the layout</strong>
+            <span class="muted small">Flip element positions horizontally to
+              match the new reading direction. Turn off to keep positions and
+              only re-align the text.</span>
+          </span>
+        </label>
+
+        <label class="switch-row">
+          <input type="checkbox" id="opt-flip-images" checked>
+          <span>
+            <strong>Flip directional graphics</strong>
+            <span class="muted small">Reverse arrows and flow diagrams that
+              imply a reading direction.</span>
+          </span>
+        </label>
+
+        <label class="switch-row">
+          <input type="checkbox" id="opt-underline" checked>
+          <span>
+            <strong>Keep underlines</strong>
+            <span class="muted small">Underlining is uncommon in Arabic
+              typography — turn this off to drop it.</span>
+          </span>
+        </label>
+      </div>
+
+      <button id="translate-btn" class="primary wide" disabled>Translate document</button>
+    </section>
+
+    <!-- 2. Progress -->
+    <section id="view-progress" class="card" hidden>
+      <h2>Translating</h2>
+      <p class="muted" id="progress-filename"></p>
+
+      <div class="progress-track" role="progressbar" aria-valuemin="0"
+           aria-valuemax="100" aria-valuenow="0" id="progress-bar-outer">
+        <div class="progress-fill" id="progress-fill"></div>
+      </div>
+      <p class="progress-message" id="progress-message">Waiting to start…</p>
+
+      <ol class="stages" id="stages">
+        <li data-stage="extracting"><span class="dot"></span>Extracting content</li>
+        <li data-stage="translating"><span class="dot"></span>Translating</li>
+        <li data-stage="rebuilding"><span class="dot"></span>Rebuilding document</li>
+        <li data-stage="done"><span class="dot"></span>Done</li>
+      </ol>
+    </section>
+
+    <!-- 3. Result -->
+    <section id="view-result" class="card" hidden>
+      <div class="result-head">
+        <div class="check" aria-hidden="true">✓</div>
+        <div>
+          <h2>Translation ready</h2>
+          <p class="muted" id="result-filename"></p>
+        </div>
+      </div>
+
+      <div class="result-actions">
+        <a id="download-link" class="primary" download>Download translated file</a>
+        <button id="another" class="ghost">Translate another</button>
+      </div>
+
+      <div id="qa-section" class="qa" hidden>
+        <h3>Things worth checking</h3>
+        <p class="muted small">The translation is complete. These notes flag
+           anything the pipeline had to adjust.</p>
+        <div id="qa-summary" class="qa-summary"></div>
+        <div id="qa-list"></div>
+      </div>
+    </section>
+  </main>
+
+  <script src="/static/app.js"></script>
+  <script>initApp();</script>
+</body>
+</html>

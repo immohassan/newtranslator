@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sign in · Document Translator</title>
+<link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body class="centered">
+  <main class="card login-card">
+    <div class="brand">
+      <div class="brand-mark">ع</div>
+      <div>
+        <h1>Document Translator</h1>
+        <p class="muted">English ⇄ Arabic, with the layout kept intact</p>
+      </div>
+    </div>
+
+    <form id="login-form" novalidate>
+      <label for="username">Username</label>
+      <input id="username" name="username" type="text" autocomplete="username"
+             required autofocus>
+
+      <label for="password">Password</label>
+      <input id="password" name="password" type="password"
+             autocomplete="current-password" required>
+
+      <div id="login-error" class="form-error" role="alert" hidden></div>
+
+      <button type="submit" id="login-button" class="primary wide">Sign in</button>
+    </form>
+  </main>
+
+  <script src="/static/app.js"></script>
+  <script>initLogin();</script>
+</body>
+</html>

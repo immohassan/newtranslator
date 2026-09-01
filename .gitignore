@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+*.pyc
+storage/
+.env
+tests/fixtures/
+.pytest_cache/
+.env.example
+.env*

@@ -126,6 +126,9 @@ class DocBlock:
     centred: bool = False
     ordered: bool = False           # numbered list item
     standalone: bool = False        # an entry the source set on its own line
+    # Where a standalone line starts, so a run of them can be tested for the
+    # shared edge that tells a real list from a stack of title lines.
+    indent: float = 0.0
     caption: bool = False           # two_sided: two independent text columns
     float_side: str = ""            # image: "start" when text runs beside it
     rows: list[list[str]] = field(default_factory=list)   # table only
@@ -266,6 +269,16 @@ def _is_really_a_grid(rows: list[list[str]]) -> bool:
     related = sum(1 for row in rows
                   if sum(1 for cell in row if cell.strip()) >= 2)
     return related >= len(rows) * GRID_MIN_FILLED_ROW_SHARE
+
+
+# A rule this far outside a table's box is still that table's own border: the
+# stroke has width, and a page's coordinates rarely land on the exact edge.
+TABLE_RULE_SLACK = 6.0
+
+
+def _rule_belongs_to_table(y: float, box: BBox) -> bool:
+    """Whether a horizontal rule at `y` is part of this table's grid."""
+    return box.y0 - TABLE_RULE_SLACK <= y <= box.y1 + TABLE_RULE_SLACK
 
 
 def _find_tables(page: Page, source: "fitz.Page") -> list[tuple[BBox, list, bool]]:
@@ -510,8 +523,13 @@ def extract_structure(page: Page, qa: QAReport,
     # centring test can still see that a line had neighbours on its baseline.
     all_lines = [l for _, l in lines]
 
+    # A grid's own ruling lines are not section dividers. They are excluded by
+    # the table's full box rather than by its y-range alone: a table's top
+    # border sits exactly on that boundary, and the row separators just inside
+    # it, so a rule tested only against the interior escaped and was drawn
+    # again as a divider - the stray lines that appeared under a letterhead.
     rules = [r for r in _section_rules(page, text_left, text_right)
-             if not any(box.y0 - 2 <= r[0] <= box.y1 + 2 for box, _, _ in tables)]
+             if not any(_rule_belongs_to_table(r[0], box) for box, _, _ in tables)]
 
     # A caption sets two independent columns side by side: the parties down
     # the left, the document's own labels down the right. Its lines interleave
@@ -755,7 +773,8 @@ def extract_structure(page: Page, qa: QAReport,
             if solo:
                 blocks.append(DocBlock(kind="paragraph",
                                        fragments=_fragments(spans),
-                                       centred=centred, standalone=True))
+                                       centred=centred, standalone=True,
+                                       indent=line.bbox.x0))
                 continue
             if pending and not pending[-1].text.endswith(" "):
                 pending[-1].text += " "
@@ -934,12 +953,19 @@ img.float-start {{
   margin: 0 0 0.5em 0;
   margin-inline-end: 0.9em;
 }}
+/* A table is free to break across pages. Held together it can only move as
+   a unit, so a grid taller than the room left below the heading above it
+   jumps to the next page whole and leaves the first one nearly empty - which
+   is worse than a break, and is what a long schedule did. Rows themselves
+   stay intact, and the header repeats on each page the table continues onto,
+   so a split is readable. */
 table {{
   width: 100%;
   border-collapse: collapse;
   margin: 0.5em 0 0.8em;
-  break-inside: avoid;
 }}
+thead {{ display: table-header-group; }}
+tr {{ break-inside: avoid; }}
 th, td {{
   border: 0.5pt solid currentColor;
   padding: 0.3em 0.5em;
@@ -995,10 +1021,56 @@ def _render_table(block: DocBlock, rtl: bool, base: float,
     return "".join(out)
 
 
+# A run of markerless standalone lines is only a list when it is long enough
+# to read as one. A pair of lines under a title is a subtitle, not two bullets.
+MIN_MARKERLESS_LIST = 3
+# ...and its entries must start from the same edge, within this much slack.
+LIST_EDGE_TOLERANCE = 4.0
+
+
+def _markerless_lists(blocks: list[DocBlock]) -> set[int]:
+    """Which standalone paragraphs should be rendered as list items.
+
+    A producer that sets every entry of a list on its own line writes a list
+    with no marker characters, and running those entries together loses the
+    separation the reader sees. But a designed page sets *every* line as its
+    own block - the title, the subtitle, the byline under it - and treating
+    each of those as an entry decorates the whole title block with bullets
+    that were never in the source.
+
+    A real list is told from a title block by the two things that make it one:
+    its entries stack up from a shared left edge, and there are enough of them
+    to be a list rather than a couple of lines under a heading. A centred line
+    is never an entry - centring is what a title does and what a list cannot.
+    """
+    listed: set[int] = set()
+    run: list[DocBlock] = []
+
+    def close() -> None:
+        if len(run) >= MIN_MARKERLESS_LIST:
+            edge = min(b.indent for b in run)
+            if all(abs(b.indent - edge) <= LIST_EDGE_TOLERANCE for b in run):
+                listed.update(id(b) for b in run)
+        run.clear()
+
+    for block in blocks:
+        if block.kind == "bullet":
+            # An explicit marker is a list on its own account; it neither joins
+            # a markerless run nor breaks one.
+            continue
+        if block.kind == "paragraph" and block.standalone and not block.centred:
+            run.append(block)
+        else:
+            close()
+    close()
+    return listed
+
+
 def _render_page(blocks: list[DocBlock], rtl: bool, base: float,
                  scale: float) -> str:
     out: list[str] = []
     in_list = ""          # "ul", "ol", or "" when no list is open
+    markerless = _markerless_lists(blocks)
 
     def close_list() -> None:
         nonlocal in_list
@@ -1010,8 +1082,7 @@ def _render_page(blocks: list[DocBlock], rtl: bool, base: float,
         # A run of entries the source set on their own lines is a list, even
         # though it carries no marker characters. Rendering it as one keeps
         # the entries visually separate instead of running them together.
-        listish = block.kind == "bullet" or (
-            block.kind == "paragraph" and block.standalone)
+        listish = block.kind == "bullet" or id(block) in markerless
         wanted = ("ol" if block.ordered else "ul") if listish else ""
         if in_list and wanted != in_list:
             # A run of a different kind ends the current list, so a numbered
@@ -1223,9 +1294,19 @@ def suits_html_pipeline(doc: Document) -> bool:
 
     The two are told apart by how much vector artwork a page carries against
     how much text. Nothing here is about the file format; a PDF can be either.
+
+    A table overrides that judgement. A grid is the one structure the
+    coordinate path cannot keep: its cells are sized for the source words, and
+    a translation that grows has nowhere to go but across the ruling line into
+    the cell beside it. A letterhead logo is easily enough filled artwork to
+    read as a "designed page", so a plain one-page schedule or invoice was
+    being redrawn instead of re-flowed, and its table came apart. Reflow keeps
+    the grid, so any document with a real table takes this path.
     """
     if not doc.pages:
         return False
+    if has_tables(doc):
+        return True
     artwork = sum(
         len([d for d in page.drawings if d.fill and d.kind == "path"])
         for page in doc.pages
@@ -1235,6 +1316,25 @@ def suits_html_pipeline(doc: Document) -> bool:
     if per_page >= ARTWORK_PER_PAGE and chars < DENSE_TEXT_CHARS:
         return False
     return True
+
+
+def has_tables(doc: Document) -> bool:
+    """Whether any page of the source carries a real grid.
+
+    Detection needs the source page's ruling lines, which the extracted model
+    does not carry, so the file is reopened here. A file that cannot be
+    reopened simply reports no tables and the ordinary heuristics decide.
+    """
+    try:
+        with fitz.open(doc.source_path) as source:
+            for page in doc.pages:
+                if page.number >= len(source):
+                    continue
+                if _find_tables(page, source[page.number]):
+                    return True
+    except Exception:
+        return False
+    return False
 
 
 def run_html_pipeline(doc: Document, output_path: str, direction: str,

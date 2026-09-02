@@ -12,12 +12,13 @@ from .merge import (
     inline_embedded_fragments,
     drop_vector_bullets,
     split_contact_lines,
+    split_table_cells,
     merge_fragments,
     merge_paragraph_lines,
     strip_stray_glyphs,
 )
 from .mirror import MirrorMode, mirror_document_pages, resolve_mode
-from .models import Document
+from .models import BBox, Document
 from .qa import QAReport
 from .rebuild_docx import rebuild_docx
 from .rebuild_pdf import rebuild_pdf
@@ -46,6 +47,40 @@ class TranslationOptions:
 
 def _noop(stage: str, percent: int, message: str) -> None:
     pass
+
+
+def _table_cells(doc: Document) -> dict[int, list]:
+    """The table cells of every page, read from the untouched source file.
+
+    Cells are inferred from the page's ruling lines, which the extracted model
+    does not carry, so the file is reopened here. A file that cannot be read
+    yields no cells and the ordinary layout rules apply unchanged.
+    """
+    import fitz
+
+    found: dict[int, list] = {}
+    try:
+        with fitz.open(doc.source_path) as source:
+            for page in doc.pages:
+                if page.number >= len(source):
+                    continue
+                try:
+                    tables = source[page.number].find_tables()
+                except Exception:
+                    continue
+                boxes = []
+                for table in tables.tables:
+                    for cell in getattr(table, "cells", []) or []:
+                        if cell is None:
+                            continue
+                        box = BBox(*cell)
+                        if box.width > 2 and box.height > 2:
+                            boxes.append(box)
+                if boxes:
+                    found[page.number] = boxes
+    except Exception:
+        return {}
+    return found
 
 
 def _translate_pdf(doc: Document, direction: str, qa: QAReport,
@@ -132,7 +167,28 @@ def run_pipeline(
         # Designed pages split sentences across separately positioned blocks.
         # Merge them first so the translator sees whole sentences.
         rtl_source = options.direction == "ar2en"
+        # Table cells come first, before any merging. The extractor hands back
+        # a whole table row as one block whose lines are really its cells, and
+        # every pass below would then treat that row as one paragraph: it is
+        # translated as a single string and redrawn flowing across the columns,
+        # which scatters the row's words into the wrong cells. Splitting on the
+        # ruling lines here also tags each block with the cell it belongs to,
+        # so nothing merges across a wall and nothing is drawn past one.
+        cells_by_page = _table_cells(doc)
         for page in doc.pages:
+            cells = cells_by_page.get(page.number, [])
+            if cells:
+                divided = split_table_cells(page, cells)
+                if divided:
+                    qa.add(
+                        "layout",
+                        "info",
+                        f"Page {page.number + 1}: {divided} table row(s) were "
+                        f"split back into their own cells so each cell's text "
+                        f"stays inside its own borders.",
+                        page=page.number + 1,
+                        count=divided,
+                    )
             stray = strip_stray_glyphs(page)
             if stray:
                 qa.add(

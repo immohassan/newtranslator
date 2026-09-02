@@ -23,6 +23,22 @@ ROW_TOLERANCE = 0.6      # as a fraction of the smaller block's height
 MAX_GAP = 40.0
 # A block taller than this many lines is a paragraph, not a fragment.
 MAX_MERGE_LINES = 2
+# A line counts as belonging to a cell when this much of it lies inside.
+CELL_CONTAINMENT = 0.6
+
+
+def _same_cell(a: TextBlock, b: TextBlock) -> bool:
+    """Whether two blocks may be joined without crossing a ruling line.
+
+    A cell wall is the one boundary merging must never reach across: text from
+    two cells joined into one block is translated as one string and redrawn as
+    one paragraph, which is exactly how a table row ends up flowed across its
+    columns. Blocks outside any table are unconstrained, as before.
+    """
+    return a.cell is b.cell or (
+        a.cell is not None and b.cell is not None
+        and a.cell.as_tuple() == b.cell.as_tuple()
+    )
 
 
 def _same_row(a: TextBlock, b: TextBlock) -> bool:
@@ -194,6 +210,101 @@ def _looks_like_vector_bullet(drawing) -> bool:
 # Two lines of one block that share no horizontal span are not stacked text -
 # they are separate items the extractor happened to group together.
 CONTACT_SPLIT_OVERLAP = 2.0
+
+
+def split_table_cells(page: Page, cells: list[BBox]) -> int:
+    """Split any block that straddles a table's ruling lines.
+
+    PyMuPDF groups text by proximity, so the three cells of one table row -
+    a time, a name, a room - come back as a single block whose "lines" are
+    really the cells beside each other. Translated as one string and redrawn as
+    one paragraph, the row is flowed across the whole table: the words land in
+    whichever cell the reflow happens to reach, which is how a schedule ends up
+    with a name in the time column and empty boxes below it.
+
+    A cell is a hard boundary, so this splits such a block back into one block
+    per cell before anything else sees it. Each cell is then translated on its
+    own and redrawn inside its own borders - the words stay in the cell they
+    started in.
+
+    Returns the number of blocks that were split.
+    """
+    if not cells:
+        return 0
+    split = 0
+    out: list[TextBlock] = []
+    for block in page.blocks:
+        groups = _lines_by_cell(block, cells)
+        if groups is None:
+            # Not a straddling block, but it may still sit wholly inside one
+            # cell - a wrapped paragraph in a wide column. Tag it so it is
+            # kept inside those borders too.
+            if block.bbox is not None:
+                block.cell = _cell_of(block.bbox, cells)
+            out.append(block)
+            continue
+        for lines in groups:
+            box = lines[0].bbox
+            for line in lines[1:]:
+                box = box.union(line.bbox)
+            piece = TextBlock(lines=lines, bbox=box, block_no=block.block_no)
+            piece.mirror = block_is_rtl(piece)
+            piece.cell = _cell_of(box, cells)
+            out.append(piece)
+        split += 1
+    page.blocks = out
+    return split
+
+
+def _lines_by_cell(block: TextBlock,
+                   cells: list[BBox]) -> Optional[list[list[Line]]]:
+    """The block's lines regrouped by the cell each one sits in.
+
+    Returns None - leave the block alone - unless its lines genuinely fall into
+    two or more different cells. A paragraph wrapped inside one cell is not a
+    straddling block and must keep its lines together, or it is translated a
+    line at a time and loses its sentences.
+    """
+    lines = [l for l in block.lines if l.text.strip() and l.bbox]
+    if len(lines) < 2:
+        return None
+
+    groups: list[list[Line]] = []
+    seen: list[Optional[BBox]] = []
+    for line in lines:
+        cell = _cell_of(line.bbox, cells)
+        if cell is None:
+            return None
+        for i, other in enumerate(seen):
+            if other is cell:
+                groups[i].append(line)
+                break
+        else:
+            seen.append(cell)
+            groups.append([line])
+    if len(groups) < 2:
+        return None
+    return groups
+
+
+def _cell_of(box: BBox, cells: list[BBox]) -> Optional[BBox]:
+    """The smallest cell holding most of `box`, if any.
+
+    Source text is routinely drawn a hair over its own ruling line, so this
+    asks which cell the line mostly sits in rather than demanding containment.
+    """
+    area = max(box.width * box.height, 0.01)
+    best: Optional[BBox] = None
+    for cell in cells:
+        overlap_w = min(box.x1, cell.x1) - max(box.x0, cell.x0)
+        overlap_h = min(box.y1, cell.y1) - max(box.y0, cell.y0)
+        if overlap_w <= 0 or overlap_h <= 0:
+            continue
+        if (overlap_w * overlap_h) / area < CELL_CONTAINMENT:
+            continue
+        if best is None or cell.width * cell.height < best.width * best.height:
+            best = cell
+    return best
 
 
 def split_contact_lines(page: Page) -> int:
@@ -486,6 +597,9 @@ def _combine(blocks: list[TextBlock], rtl: bool) -> TextBlock:
     # Without this a merged block silently falls back to the default and an
     # English footer built from several fragments gets mirrored.
     merged.mirror = block_is_rtl(merged)
+    # Every member shares one cell - merging across a wall is refused above -
+    # so the joined block belongs to that same cell.
+    merged.cell = ordered[0].cell
     return merged
 
 
@@ -508,6 +622,9 @@ def _same_paragraph(a: TextBlock, b: TextBlock) -> bool:
     if abs(style_a.size - style_b.size) > SIZE_TOLERANCE:
         return False
     if style_a.bold != style_b.bold:
+        return False
+
+    if not _same_cell(a, b):
         return False
 
     # Measure the line pitch against the font size, not the block height: a
@@ -616,6 +733,7 @@ def _combine_lines(blocks: list[TextBlock]) -> TextBlock:
     for block in blocks:
         merged.lines.extend(block.lines)
     merged.mirror = block_is_rtl(merged)
+    merged.cell = blocks[0].cell
     return merged
 
 
@@ -672,6 +790,8 @@ def _inline_host(fragment: TextBlock, hosts: list[TextBlock],
     for host in hosts:
         if host is fragment or host.bbox is None:
             continue
+        if not _same_cell(host, fragment):
+            continue        # never fold text from one cell into another
         if len(host.lines) < 2:
             continue        # a single line is not a paragraph to fold into
         if not host.text.strip():
@@ -758,7 +878,8 @@ def merge_fragments(page: Page, rtl: bool, direction: str = "") -> int:
             for other in candidates:
                 if id(other) in used:
                     continue
-                if any(_same_row(member, other) and _gap(member, other) <= MAX_GAP
+                if any(_same_cell(member, other) and _same_row(member, other)
+                       and _gap(member, other) <= MAX_GAP
                        for member in run):
                     run.append(other)
                     used.add(id(other))

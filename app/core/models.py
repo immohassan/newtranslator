@@ -95,6 +95,10 @@ class TextBlock:
     # of English spans inside a mirrored Arabic page is re-anchored relative to
     # the mirrored layout rather than flipped; see mirror.mirror_page.
     mirror: bool = True
+    # The table cell this block sits in, when it sits in one. A cell is a hard
+    # boundary: the block is never merged with anything outside it, and it is
+    # redrawn inside these borders rather than being allowed to grow past them.
+    cell: Optional[BBox] = None
 
     @property
     def text(self) -> str:

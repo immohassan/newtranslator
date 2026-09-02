@@ -51,6 +51,13 @@ BOX_PADDING = 1.0
 SHRINK_REVIEW_RATIO = 0.90
 # Ignore paper-thin contacts; only a real collision is worth reporting.
 OVERLAP_REPORT_RATIO = 0.15
+# Breathing room kept between a table cell's ruling line and the text inside
+# it, so a clamped translation never touches the border it must not cross.
+CELL_INSET = 1.5
+# A block counts as belonging to a cell when this much of its area lies inside
+# it. Source text is often drawn a hair over its own ruling line, so the test
+# cannot demand full containment.
+CELL_CONTAINMENT = 0.6
 
 
 def _norm(c: tuple[int, int, int]) -> tuple[float, float, float]:
@@ -123,6 +130,76 @@ def _try_draw(
     )
 
 
+def _find_cells(page_obj: Page, source: Optional["fitz.Page"]) -> list[BBox]:
+    """The table cells on this page, in the coordinates the blocks now use.
+
+    A cell is the one box on the page that text is genuinely forbidden to
+    leave: its meaning comes from the row and column it sits in, so a
+    translation that spills over a ruling line does not just look wrong, it
+    says something the source did not. Everywhere else on a page, growing into
+    neighbouring whitespace is the lesser evil - inside a grid it is the worst
+    one.
+
+    PyMuPDF finds the cells from the ruling lines. A file that cannot be read,
+    or a page with no grid, simply yields no cells and the ordinary layout
+    rules apply unchanged.
+    """
+    if source is None:
+        return []
+    try:
+        tables = source.find_tables()
+    except Exception:
+        return []
+    cells: list[BBox] = []
+    for table in tables.tables:
+        for cell in getattr(table, "cells", []) or []:
+            if cell is None:
+                continue
+            box = BBox(*cell)
+            if box.width > 2 and box.height > 2:
+                cells.append(box)
+    return cells
+
+
+def _cell_for(box: Optional[BBox], cells: list[BBox]) -> Optional[BBox]:
+    """The cell this block belongs to, if any.
+
+    The smallest cell holding most of the block wins: cells nest (a table's own
+    bbox can be reported alongside its cells), and the innermost one is the
+    boundary that actually matters.
+    """
+    if box is None or not cells:
+        return None
+    area = max(box.width * box.height, 0.01)
+    best: Optional[BBox] = None
+    for cell in cells:
+        overlap_w = min(box.x1, cell.x1) - max(box.x0, cell.x0)
+        overlap_h = min(box.y1, cell.y1) - max(box.y0, cell.y0)
+        if overlap_w <= 0 or overlap_h <= 0:
+            continue
+        if (overlap_w * overlap_h) / area < CELL_CONTAINMENT:
+            continue
+        if best is None or cell.width * cell.height < best.width * best.height:
+            best = cell
+    return best
+
+
+def _clamp_to_cell(rect: fitz.Rect, cell: Optional[BBox]) -> fitz.Rect:
+    """Trim a candidate box back inside its cell's ruling lines."""
+    if cell is None:
+        return rect
+    x0 = max(rect.x0, cell.x0 + CELL_INSET)
+    y0 = max(rect.y0, cell.y0 + CELL_INSET)
+    x1 = min(rect.x1, cell.x1 - CELL_INSET)
+    y1 = min(rect.y1, cell.y1 - CELL_INSET)
+    if x1 - x0 < 2 or y1 - y0 < 2:
+        # The inset is wider than the cell itself - a very tight grid. Use the
+        # cell as it stands rather than handing back an empty box.
+        return fitz.Rect(max(rect.x0, cell.x0), max(rect.y0, cell.y0),
+                         min(rect.x1, cell.x1), min(rect.y1, cell.y1))
+    return fitz.Rect(x0, y0, x1, y1)
+
+
 def _widen(
     rect: fitz.Rect, needed: float, max_x0: float, max_x1: float, align: int
 ) -> Optional[fitz.Rect]:
@@ -153,6 +230,7 @@ def _draw_fitted(
     page_bottom: float,
     arabic: bool = False,
     label: bool = False,
+    cell: Optional[BBox] = None,
 ) -> tuple[float, bool, fitz.Rect]:
     """Draw `text` at the largest size that actually fits.
 
@@ -164,8 +242,18 @@ def _draw_fitted(
     Returns (size_used, fitted, rect_used). Shrinks to MIN_SIZE_RATIO of the
     original, then as a last resort grows the box downwards so long
     translations spill instead of vanishing.
+
+    `cell` closes off that last resort. Text inside a table cell may not leave
+    it in any direction: the cell it lands in *is* its meaning, so a spill into
+    the neighbour reads as a different row or column. Inside a cell the search
+    keeps shrinking instead, down to a hard floor, and every candidate box is
+    trimmed back to the ruling lines before it is tried.
     """
-    floor = max(start_size * MIN_SIZE_RATIO, 4.0)
+    in_cell = cell is not None
+    # A cell may shrink harder than the page floor allows: a cramped cell is
+    # readable, a cell whose text sits on top of the next one is not.
+    floor = max(start_size * (0.5 if in_cell else MIN_SIZE_RATIO), 4.0)
+    rect = _clamp_to_cell(rect, cell)
 
     def render(box: fitz.Rect, size: float) -> str:
         if not arabic:
@@ -191,14 +279,17 @@ def _draw_fitted(
         # max_y is the top of the next element, so growing never pushes this
         # block over its neighbour - documents whose source lines already sit
         # closer together than the Arabic line height simply shrink instead.
-        taller = fitz.Rect(
+        taller = _clamp_to_cell(fitz.Rect(
             rect.x0, rect.y0, rect.x1,
             min(rect.y0 + needed_height, max_y),
-        )
+        ), cell)
         if taller.height > rect.height:
             rect = taller
 
-    if "\n" not in text:
+    # Widening is how a caption avoids an ugly wrap - it takes room from its
+    # neighbours. A cell has no room to take: everything beside it is another
+    # cell, so a widened box would print straight over the ruling line.
+    if "\n" not in text and not in_cell:
         one_line = shape(text) if arabic else text
         needed = fontlib.measure(one_line, font_path, start_size)
         # A short caption is sized to the words it held in the source, and a
@@ -235,6 +326,14 @@ def _draw_fitted(
         if attempt(rect, size):
             return size, size >= start_size, rect
         size -= SIZE_STEP
+
+    if in_cell:
+        # Out of room inside the grid. The text is drawn at the floor size and
+        # clipped by the cell rather than allowed to escape it; QA reports the
+        # shortfall to the user, who can widen the column in the source.
+        _try_draw(page, rect, render(rect, floor), fontname, font_path,
+                  floor, color, align)
+        return floor, False, rect
 
     grown = fitz.Rect(
         rect.x0, rect.y0, rect.x1,
@@ -282,9 +381,13 @@ def _draw_block(
     max_y: float,
     max_x0: float,
     max_x1: float,
+    cell: Optional[BBox] = None,
 ) -> Optional[BBox]:
     """Draw one block. Returns the box it actually occupied, so the caller can
-    check the finished layout for collisions."""
+    check the finished layout for collisions.
+
+    `cell` is the table cell this block sits in, when it sits in one; it is a
+    hard boundary the drawn text may not cross."""
     text = block.translated if block.translated is not None else block.text
     # Belt and braces: a translation provider can return no-break spaces of its
     # own, and _wrap_lines splits on U+0020 only. Per-line leading and trailing
@@ -346,6 +449,7 @@ def _draw_block(
         min(box.x1 + BOX_PADDING, page_obj.width - 1),
         min(box.y1 + BOX_PADDING, page_obj.height - 1),
     )
+    rect = _clamp_to_cell(rect, cell)
     if rect.width <= 2 or rect.height <= 2:
         return None
 
@@ -372,7 +476,8 @@ def _draw_block(
     size, fitted, rect = _draw_fitted(
         page, rect, text, fontname, resolved.path, start_size,
         _norm(style.color), align, max_y, max_x0, max_x1,
-        page_obj.height - 2, arabic=use_arabic_font, label=is_label,
+        page_obj.height - 2, arabic=use_arabic_font,
+        label=is_label and cell is None, cell=cell,
     )
     display = shape(text) if use_arabic_font else shape_for_render(text, direction)
 
@@ -391,6 +496,20 @@ def _draw_block(
     # instead so the text is never dropped. A box that had to grow beyond its
     # designed area is the honest signal that the translation did not fit, so
     # it is reported even when the font size itself barely moved.
+    if cell is not None and size < start_size * SHRINK_REVIEW_RATIO:
+        qa.add(
+            "layout_review",
+            "warning",
+            f"Translated text in a table cell on page {page_obj.number + 1} was "
+            f"shrunk to fit its cell rather than allowed to overflow into the "
+            f"cells beside it - widen that column in the source if it reads "
+            f"too small.",
+            page=page_obj.number + 1,
+            excerpt=text[:80],
+            size=round(size, 2),
+            original_size=round(start_size, 2),
+        )
+
     original_area = max(box.width * box.height, 1.0)
     grown_share = (rect.get_area() / original_area) if original_area else 1.0
     if grown_share > 1.0 + (1.0 - SHRINK_REVIEW_RATIO):
@@ -625,6 +744,13 @@ def rebuild_pdf(
     """Write the translated PDF. `doc` must already be translated and mirrored."""
     pdf = fitz.open(doc.source_path)
     try:
+        # Cells are read from the untouched source, before any redaction
+        # strips the ruling lines they are inferred from.
+        cells_by_page = {
+            page_obj.number: _find_cells(page_obj, pdf[page_obj.number])
+            for page_obj in doc.pages
+            if page_obj.number < len(pdf)
+        }
         for page_obj in doc.pages:
             page = pdf[page_obj.number]
 
@@ -715,6 +841,18 @@ def rebuild_pdf(
             # block below it.
             occupied = [b.bbox for b in page_obj.blocks if b.bbox] + \
                        [i.bbox for i in page_obj.images]
+            # The blocks have already been mirrored, so the cells they are
+            # matched against have to be mirrored the same way to still line
+            # up with them.
+            #
+            # The cell recorded on a block was measured before mirroring, and
+            # mirroring moves different blocks by different rules (a preserved
+            # block does not move at all), so the box on the block is not
+            # re-used here - only the fact that the block came from a cell.
+            # Which cell it now sits in is decided from its final position.
+            cells = cells_by_page.get(page_obj.number, [])
+            if mode is MirrorMode.FULL:
+                cells = [mirror_bbox(c, page_obj.width) for c in cells]
             drawn: list[tuple[BBox, TextBlock]] = []
             for block in page_obj.blocks:
                 max_y = page_obj.height - 2
@@ -750,8 +888,10 @@ def rebuild_pdf(
                                 max_x0 = max(max_x0, other.x1 + 2)
                             elif other.x0 >= block.bbox.x1 - 1:
                                 max_x1 = min(max_x1, other.x0 - 2)
+                cell = _cell_for(block.bbox, cells)
                 placed = _draw_block(page, page_obj, block, direction, mode, qa,
-                                     underline_enabled, max_y, max_x0, max_x1)
+                                     underline_enabled, max_y, max_x0, max_x1,
+                                     cell=cell)
                 if placed is not None:
                     drawn.append((placed, block))
 

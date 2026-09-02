@@ -231,8 +231,14 @@ def _friendly_error(exc: Exception) -> str:
         return "The translation service rejected the request. Check the API key."
     if "timeout" in lowered or "timed out" in lowered:
         return "The translation service timed out. Try again in a moment."
-    return ("Something went wrong while translating this document. "
-            "The details have been logged for the administrator.")
+    # Nothing matched. The stack trace stays in the log, but the exception's
+    # type goes to the user: "Something went wrong" is the same sentence for
+    # every fault, so a report of one carries no information back to whoever
+    # has to find it. The type names the fault without exposing a path or a
+    # line of source.
+    return (f"Something went wrong while translating this document "
+            f"({type(exc).__name__}). The details have been logged for the "
+            f"administrator.")
 
 
 store = JobStore()

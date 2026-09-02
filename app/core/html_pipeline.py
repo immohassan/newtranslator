@@ -514,8 +514,19 @@ def extract_structure(page: Page, qa: QAReport,
     if tables:
         lines = [(b, l) for b, l in lines
                  if not any(_inside(l.bbox, box) for box, _, _ in tables)]
-        if not lines and not tables:
-            return []
+        if not lines:
+            # The page is nothing but its grid - a sign-off sheet, a rota, a
+            # form. Every line was consumed as a cell, so there is no running
+            # text left to measure the column from, and everything below this
+            # point describes text that is not there. The tables are the whole
+            # page: emit them and stop.
+            #
+            # This is a crash rather than a layout fault when it is missed:
+            # the text extents are taken with min()/max() over the lines, and
+            # over none of them that raises, which failed the whole job.
+            return [DocBlock(kind="table", rows=rows, header=header)
+                    for _, rows, header in sorted(tables,
+                                                  key=lambda t: t[0].y0)]
 
     text_left = min(l.bbox.x0 for _, l in lines)
     text_right = max(l.bbox.x1 for _, l in lines)
@@ -1345,9 +1356,30 @@ def run_html_pipeline(doc: Document, output_path: str, direction: str,
 
     # The source page is handed through so table detection can use its ruling
     # lines, which the extracted model does not carry.
+    #
+    # Reading a page's structure is a best-effort analysis of someone else's
+    # file, and one page that defeats it must not cost the reader the whole
+    # document. A page that raises is reported and skipped rather than
+    # aborting the job, which is what an unusual layout used to do.
     with fitz.open(doc.source_path) as source:
-        pages = [extract_structure(page, qa, source[page.number])
-                 for page in doc.pages]
+        pages = []
+        for page in doc.pages:
+            try:
+                pages.append(extract_structure(page, qa, source[page.number]))
+            except Exception as exc:
+                qa.add(
+                    "structure",
+                    "warning",
+                    f"Page {page.number + 1} could not be read as a structured "
+                    f"document and was left out of the rebuilt file - check "
+                    f"this page against the original.",
+                    page=page.number + 1,
+                    error=f"{type(exc).__name__}: {exc}",
+                )
+                pages.append([])
+    if not any(pages):
+        raise ValueError(
+            "no page of this document could be read as structured content")
     _translate_blocks(pages, direction, qa)
 
     first = doc.pages[0]

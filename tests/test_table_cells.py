@@ -5,6 +5,8 @@ times, names and rooms - came back with the rows flowed across the columns,
 names in the time column and several cells left empty. Two separate causes,
 one per half of this file.
 """
+import os
+
 import fitz
 import pytest
 
@@ -362,3 +364,96 @@ def test_table_ruling_lines_are_not_redrawn_as_dividers(tmp_path):
     kept = [r for r in _section_rules(page, 60.0, 540.0)
             if not any(_rule_belongs_to_table(r[0], b) for b, _, _ in tables)]
     assert not kept
+
+
+# --- a page that is nothing but its grid -----------------------------------
+
+def _write_signoff_sheet(path):
+    """A sign-off sheet: a full-page table with no text outside it.
+
+    A rota, a form and a signature sheet all have this shape, and it is the
+    one shape where table detection consumes every line on the page.
+    """
+    doc = fitz.open()
+    page = doc.new_page(width=595, height=842)
+    rows = [("Name", "Role", "Signature", "Date")]
+    rows += [(f"Person {i}", "Approver", "", f"2026-08-{10 + i}")
+             for i in range(1, 12)]
+    columns = [60.0, 190.0, 320.0, 450.0, 540.0]
+    y = 100.0
+    for row in rows:
+        for col, text in enumerate(row):
+            rect = fitz.Rect(columns[col], y, columns[col + 1], y + 34.0)
+            page.draw_rect(rect, color=(0, 0, 0), width=0.7)
+            if text:
+                page.insert_textbox(rect + (3, 6, -3, 0), text, fontsize=9,
+                                    align=1)
+        y += 34.0
+    doc.save(path)
+    doc.close()
+    return path
+
+
+def test_a_page_that_is_only_a_table_is_read(tmp_path):
+    """Every line of such a page is consumed as a cell, leaving nothing to
+    measure the text column from. Taking the extents anyway raised
+    `ValueError: min() iterable argument is empty` and failed the whole job."""
+    import fitz as _fitz
+    from app.core.html_pipeline import extract_structure
+
+    src = _write_signoff_sheet(str(tmp_path / "signoff.pdf"))
+    qa = QAReport()
+    doc = extract(src, qa)
+    with _fitz.open(doc.source_path) as source:
+        blocks = extract_structure(doc.pages[0], qa, source[0])
+
+    assert blocks, "the page's table must still be emitted"
+    assert all(b.kind == "table" for b in blocks)
+    assert any("Approver" in cell for b in blocks for row in b.rows
+               for cell in row)
+
+
+def test_a_page_that_is_only_a_table_translates_end_to_end(tmp_path):
+    """The failure the user saw: the job died rather than producing a file."""
+    src = _write_signoff_sheet(str(tmp_path / "signoff.pdf"))
+    out = str(tmp_path / "out.pdf")
+    run_pipeline(src, out, TranslationOptions("en2ar", mirror=True))
+
+    with fitz.open(out) as doc:
+        assert len(doc) >= 1
+        # The dates are bare numerals: a real translator leaves them, so they
+        # are the check that the grid's content actually survived.
+        assert "2026-08-11" in doc[0].get_text()
+
+
+def test_one_unreadable_page_does_not_lose_the_document(tmp_path, monkeypatch):
+    """Reading a page's structure is a best-effort analysis of someone else's
+    file. A page that defeats it is reported and skipped; it used to abort the
+    job, so a single odd layout cost the reader every other page."""
+    from app.core import html_pipeline
+
+    src = str(tmp_path / "two.pdf")
+    doc = fitz.open()
+    for text in ("First page text", "Second page text"):
+        page = doc.new_page(width=595, height=842)
+        page.insert_text((72, 100), text, fontsize=14)
+    doc.save(src)
+    doc.close()
+
+    real = html_pipeline.extract_structure
+
+    def explode(page, qa, source=None):
+        if page.number == 0:
+            raise ValueError("min() iterable argument is empty")
+        return real(page, qa, source)
+
+    monkeypatch.setattr(html_pipeline, "extract_structure", explode)
+
+    out = str(tmp_path / "out.pdf")
+    qa = QAReport()
+    run_pipeline(src, out, TranslationOptions("en2ar", mirror=True), qa)
+
+    assert os.path.exists(out)
+    warned = [e for e in qa.entries
+              if e.category == "structure" and e.severity == "warning"]
+    assert warned, "the skipped page must be reported to the user"

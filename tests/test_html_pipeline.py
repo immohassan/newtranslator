@@ -32,6 +32,10 @@ from app.core.translate import TranslationProvider
 import app.core.translate as translate_mod
 
 RESUME = "storage/ca0ecb41492345f8b3647bbb59be0033/input.pdf"
+# A CV whose header is set beside a portrait photograph.
+PHOTO_CV = "storage/f919949baa8c426fb4549be8a1c95f6a/input.pdf"
+needs_photo_cv = pytest.mark.skipif(not os.path.exists(PHOTO_CV),
+                                    reason="sample not present")
 needs_resume = pytest.mark.skipif(not os.path.exists(RESUME),
                                   reason="sample resume not present")
 needs_browser = pytest.mark.skipif(not is_available(),
@@ -200,7 +204,33 @@ def test_two_sided_rows_use_one_flex_rule():
                        right=[Fragment("April 2023")])]
     markup = _html_for(blocks)
     assert "justify-content: space-between" in markup
-    assert 'class="two-sided"' in markup
+    # A two-cell row also carries "pair", which pins the trailing date to the
+    # far margin and keeps it on one line.
+    assert 'class="two-sided pair"' in markup
+
+
+def test_a_row_of_several_cells_keeps_every_cell_in_the_row():
+    """A banner of labelled fields is one row, not a row plus loose text.
+
+    The header of a CV sets three or more cells across a single baseline.
+    Grouping only the first and last left the cells between them to be emitted
+    as paragraphs under the row.
+    """
+    blocks = [DocBlock(kind="two_sided",
+                       fragments=[Fragment("Place of birth: Lahore")],
+                       extra=[[Fragment("Nationality: Pakistani")],
+                              [Fragment("Gender: Female")]],
+                       right=[Fragment("Phone number:")])]
+    markup = _html_for(blocks)
+    for cell in ("Place of birth: Lahore", "Nationality: Pakistani",
+                 "Gender: Female", "Phone number:"):
+        assert cell in markup
+    # One row, and it may wrap - a four-cell banner cannot be held on one line
+    # the way a "Job Title .... Date" pair is.
+    assert markup.count('class="two-sided') == 1
+    assert 'class="two-sided row-wrap"' in markup
+    assert markup.index("Place of birth") < markup.index("Nationality") \
+        < markup.index("Gender") < markup.index("Phone number")
 
 
 def test_rtl_is_set_on_the_document_not_computed_per_block():
@@ -426,6 +456,163 @@ def test_centring_needs_indent_at_both_ends():
     assert _is_centred(line(200, 400), 54, 533)      # pulled in both sides
     assert not _is_centred(line(54, 400), 54, 533)   # flush left
     assert not _is_centred(line(54, 533), 54, 533)   # full width
+
+    # A middle cell of a row is indented at both ends by the cells either side
+    # of it, which is the centring test exactly. Sharing a baseline with
+    # another line settles it: this is a cell, not a centred line.
+    middle = line(200, 400)
+    neighbours = [line(54, 190), middle, line(410, 533)]
+    assert not _is_centred(middle, 54, 533, neighbours)
+    assert _is_centred(middle, 54, 533, [middle])
+
+
+def test_side_by_side_text_is_not_mistaken_for_a_table():
+    """PyMuPDF infers a table from alignment; a caption is not one.
+
+    A court caption sets the parties down one side and the document's labels
+    down the other. Detected as a table it gains borders the source never had
+    and its two halves are combed together row by row.
+    """
+    from app.core.html_pipeline import _is_really_a_grid
+
+    caption = [["Plaintiff,", "STATEMENT"],
+               ["", "OF NET WORTH"],
+               ["", "DATED:"],
+               ["- against -", ""],
+               ["", "Index No."],
+               ["Defendant.", ""]]
+    assert not _is_really_a_grid(caption)
+
+    # A real table relates the cells along each row, and keeps its grid.
+    grid = [["(a)", "Plaintiff's date of birth:", "1983-10-07"],
+            ["(b)", "Defendant's date of birth:", "1982-09-30"],
+            ["(c)", "Date married:", "2021-08-11"]]
+    assert _is_really_a_grid(grid)
+
+
+def test_a_caption_keeps_its_two_columns_whole():
+    """The two halves of a caption interleave; read in order they comb together.
+
+    Each column has to be gathered whole, or the output reads "Index No. Date
+    Action Commenced: Defendant." - three unrelated lines run together.
+    """
+    from app.core.models import BBox as B, Line, Span
+    from app.core.html_pipeline import _caption_region
+
+    def line(text, x0, x1, y):
+        span = Span(text, "helv", 11.0, (0, 0, 0), False, False, False,
+                    B(x0, y, x1, y + 12), origin=(x0, y + 12))
+        return (None, Line(spans=[span], bbox=B(x0, y, x1, y + 12)))
+
+    lines = [
+        line("Plaintiff,", 72, 117, 143),
+        line("STATEMENT", 412, 488, 143),
+        line("OF NET WORTH", 412, 509, 157),
+        line("DATED:", 412, 460, 171),
+        line("- against -", 75, 183, 186),
+        line("Index No.", 412, 468, 200),
+        line("Defendant.", 72, 128, 243),
+        # A page footer sits in the same margin and must stay out of it.
+        line("Page 1", 516, 540, 753),
+    ]
+    region = _caption_region(lines, 72, 540)
+    assert region, "the caption must be recognised"
+    left, right = region
+    assert "Page 1" not in " ".join(s.text for l in right for s in l.spans)
+    joined = " ".join(s.text for l in right for s in l.spans)
+    assert "STATEMENT" in joined and "Index No." in joined
+
+
+def test_a_page_of_dated_rows_is_not_a_caption():
+    """A resume's rows pair off on shared baselines - that is not a caption."""
+    from app.core.models import BBox as B, Line, Span
+    from app.core.html_pipeline import _caption_region
+
+    def line(text, x0, x1, y):
+        span = Span(text, "helv", 11.0, (0, 0, 0), False, False, False,
+                    B(x0, y, x1, y + 12), origin=(x0, y + 12))
+        return (None, Line(spans=[span], bbox=B(x0, y, x1, y + 12)))
+
+    lines = []
+    for i, y in enumerate((100, 140, 180, 220)):
+        lines.append(line(f"Job Title {i}", 72, 200, y))
+        lines.append(line(f"20{20 + i}", 460, 540, y))
+    assert _caption_region(lines, 72, 540) is None
+
+
+@needs_photo_cv
+def test_the_page_is_read_in_the_order_it_is_seen():
+    """Blocks follow their place on the page, not the producer's write order.
+
+    A PDF's content stream carries no guarantee of sequence, and a
+    template-built CV writes its section titles last. Read as stored, every
+    heading piled up at the foot of the page, stranded from the content it
+    introduces.
+    """
+    doc = extract_pdf(PHOTO_CV, QAReport())
+    for page in doc.pages:
+        blocks = extract_structure(page, QAReport())
+        kinds = [b.kind for b in blocks]
+        if kinds.count("heading") < 2:
+            continue
+        # No page may end with a run of headings carrying no content at all.
+        tail = kinds[kinds.index("heading", len(kinds) // 2):]
+        assert any(k != "heading" for k in tail), \
+            f"page {page.number + 1} ends in a stack of orphaned headings"
+
+    # The section titles of the last page each introduce something.
+    blocks = extract_structure(doc.pages[-1], QAReport())
+    titles = [i for i, b in enumerate(blocks)
+              if b.kind == "heading" and b.text.strip().isupper()]
+    assert titles, "the fixture has upper-case section titles"
+    for i in titles:
+        assert i < len(blocks) - 1, "a section title needs content after it"
+
+
+@needs_photo_cv
+def test_an_image_is_placed_where_it_sits_on_the_page():
+    """Images follow the text they belong to, not the end of the page.
+
+    Appended after every block, a CV's header portrait landed at the foot of
+    the page's content and reflow then carried it onto the following page,
+    where it sat in the middle of an unrelated section.
+    """
+    doc = extract_pdf(PHOTO_CV, QAReport())
+    page = doc.pages[0]
+    assert any(im.data for im in page.images), "the fixture carries a photo"
+    blocks = extract_structure(page, QAReport())
+    kinds = [b.kind for b in blocks]
+    first_image = kinds.index("image")
+    assert first_image < len(kinds) - 1, \
+        "a header image must not be emitted after all of the page's text"
+
+
+def test_an_image_with_text_beside_it_floats():
+    """A portrait in the corner keeps the header alongside it.
+
+    Set as a block of its own it splits the header in two and pushes the rest
+    of the page down; floated, the text wraps beside it as the source had it.
+    """
+    from app.core.models import BBox as B, ImageElement, Line, Span
+    from app.core.html_pipeline import _float_side
+
+    def line(x0, x1, y):
+        span = Span("text", "helv", 11.0, (0, 0, 0), False, False, False,
+                    B(x0, y, x1, y + 12), origin=(x0, y + 12))
+        return Line(spans=[span], bbox=B(x0, y, x1, y + 12))
+
+    corner = ImageElement(bbox=B(16, 14, 102, 100), data=b"x", ext="png")
+    beside = [line(116, 400, 13), line(116, 400, 52), line(116, 400, 75)]
+    assert _float_side(corner, beside) == "start"
+
+    # An image with text on both sides was placed inline by the producer;
+    # floating it would reorder the page.
+    both = beside + [line(10, 14, 52)]
+    assert _float_side(corner, both) == ""
+
+    # A full-width figure has nothing beside it and stays a block.
+    figure = ImageElement(bbox=B(72, 200, 520, 400), data=b"x", ext="png")
+    assert _float_side(figure, beside) == ""
 
 
 def test_centred_blocks_carry_the_class():

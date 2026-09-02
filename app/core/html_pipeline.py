@@ -117,11 +117,17 @@ class DocBlock:
     fragments: list[Fragment] = field(default_factory=list)
     level: int = 2                  # heading rank
     right: list[Fragment] = field(default_factory=list)   # two_sided only
+    # two_sided rows past the second cell. A row of three or more cells - a CV
+    # banner, a court caption - keeps the middle ones here so they stay in the
+    # row instead of being emitted as loose paragraphs beneath it.
+    extra: list[list[Fragment]] = field(default_factory=list)
     image: Optional[bytes] = None
     image_ext: str = "png"
     centred: bool = False
     ordered: bool = False           # numbered list item
     standalone: bool = False        # an entry the source set on its own line
+    caption: bool = False           # two_sided: two independent text columns
+    float_side: str = ""            # image: "start" when text runs beside it
     rows: list[list[str]] = field(default_factory=list)   # table only
     header: bool = False            # table's first row is a header
     width: float = 0.0
@@ -236,6 +242,32 @@ def _inside(inner: BBox, outer: BBox) -> bool:
             and inner.y0 >= outer.y0 - 2 and inner.y1 <= outer.y1 + 2)
 
 
+# A real table relates the cells across each of its rows. This share of rows
+# must carry two or more filled cells for the detection to be believed.
+GRID_MIN_FILLED_ROW_SHARE = 0.5
+
+
+def _is_really_a_grid(rows: list[list[str]]) -> bool:
+    """Whether a detected table is a grid rather than side-by-side text.
+
+    PyMuPDF infers a table from alignment, so any passage set in two columns
+    is reported as one - a court caption ("Plaintiff, ... STATEMENT OF NET
+    WORTH ... Index No.") is the standard case. The two halves of a caption
+    are independent runs of text that merely share a margin: the "rows" are
+    the lines of the taller half, and each holds a cell on one side only.
+
+    A real table is the opposite: a row exists precisely to relate the cells
+    along it, so most of its rows carry more than one filled cell. That
+    distinction is what separates the two here - the caption is released back
+    to the paragraph path, and a genuine grid is still lifted out whole.
+    """
+    if len(rows) < 2:
+        return True
+    related = sum(1 for row in rows
+                  if sum(1 for cell in row if cell.strip()) >= 2)
+    return related >= len(rows) * GRID_MIN_FILLED_ROW_SHARE
+
+
 def _find_tables(page: Page, source: "fitz.Page") -> list[tuple[BBox, list, bool]]:
     """Tables on the page, as (bbox, rows, has_header).
 
@@ -258,6 +290,8 @@ def _find_tables(page: Page, source: "fitz.Page") -> list[tuple[BBox, list, bool
         rows = [row for row in rows if any(cell for cell in row)]
         if len(rows) < 1 or len(rows[0]) < 2:
             continue
+        if not _is_really_a_grid(rows):
+            continue
         box = BBox(*table.bbox)
         # A header row is one whose cells are all short labels.
         header = all(len(cell) <= 40 for cell in rows[0])
@@ -265,7 +299,15 @@ def _find_tables(page: Page, source: "fitz.Page") -> list[tuple[BBox, list, bool
     return found
 
 
-def _is_centred(line, text_left: float, text_right: float) -> bool:
+def _shares_row(line, others) -> bool:
+    """Whether another line sits on this line's baseline."""
+    return any(other is not line
+               and abs(other.bbox.y0 - line.bbox.y0) <= SAME_ROW_TOLERANCE
+               for other in others)
+
+
+def _is_centred(line, text_left: float, text_right: float,
+                siblings=()) -> bool:
     """Whether a line is centred in its column rather than set flush.
 
     Judged on the indent at each end, not on where the line's midpoint falls:
@@ -276,6 +318,13 @@ def _is_centred(line, text_left: float, text_right: float) -> bool:
     """
     spans = [s for s in line.spans if s.text.strip()]
     if not spans:
+        return False
+    # A line with neighbours on its own baseline is one cell of a row, not a
+    # centred line. Its indents are set by the cells either side of it, and
+    # for a middle cell they are naturally close to equal - which is exactly
+    # the test below, so without this check every middle cell of a banner was
+    # centred and broken out of its row.
+    if _shares_row(line, siblings):
         return False
     right = spans[-1].bbox.x1
     left_pad = line.bbox.x0 - text_left
@@ -308,6 +357,117 @@ def _section_rules(page: Page, text_left: float,
     return sorted(rules)
 
 
+# A caption's two columns must each hold at least this many lines - two lines
+# beside two lines is a caption, one beside one is an ordinary row.
+CAPTION_MIN_LINES = 2
+# The right column must start beyond this share of the text column, so an
+# indented continuation line is never mistaken for a second column.
+CAPTION_COLUMN_SHARE = 0.45
+# Above this share of right-hand lines sharing a baseline with a left-hand
+# line, the region is a run of rows rather than two independent columns.
+CAPTION_MAX_PAIRED_SHARE = 0.5
+# A vertical gap wider than this ends the caption's right-hand column, so a
+# page footer set in the same margin is not drawn into it.
+CAPTION_MAX_GAP = 40.0
+# An image needs this many lines beside it before it is floated rather than
+# set as a block of its own.
+IMAGE_FLOAT_MIN_LINES = 2
+# A floated image is placed this far above its own top edge, so it precedes a
+# header line whose baseline starts just above it.
+IMAGE_FLOAT_LEAD = 12.0
+
+
+def _float_side(image, lines) -> str:
+    """"start" when the page runs text beside this image, else "".
+
+    A portrait in the corner of a CV has the header set alongside it, not
+    underneath. Emitted as a block element it would break that header in two
+    and push everything below it down a page; floated, the text wraps beside
+    it as the source had it.
+    """
+    beside = [l for l in lines
+              if l.bbox.y1 > image.bbox.y0 and l.bbox.y0 < image.bbox.y1
+              and l.bbox.x0 >= image.bbox.x1 - 2]
+    if len(beside) < IMAGE_FLOAT_MIN_LINES:
+        return ""
+    # It must sit at a margin. An image with text on both sides is a figure
+    # the producer placed inline, and floating it would reorder the page.
+    if any(l.bbox.x1 <= image.bbox.x0 + 2 for l in lines
+           if l.bbox.y1 > image.bbox.y0 and l.bbox.y0 < image.bbox.y1):
+        return ""
+    return "start"
+
+
+def _column_fragments(column: list) -> list[Fragment]:
+    """One column of a caption, its lines joined top to bottom."""
+    out: list[Fragment] = []
+    for line in sorted(column, key=lambda l: l.bbox.y0):
+        if out and not out[-1].text.endswith(" "):
+            out[-1].text += " "
+        out.extend(_fragments([sp for sp in line.spans if sp.text]))
+    return out
+
+
+def _caption_region(lines: list, text_left: float,
+                    text_right: float) -> Optional[tuple[list, list]]:
+    """The two columns of a caption block, if the page opens with one.
+
+    Detected as a contiguous run of lines that sit in two clusters - one at
+    the left margin, one well to its right - where both clusters carry
+    several lines and their vertical spans overlap. That is what makes a
+    caption different from a run of "Job Title .... Date" rows: the columns
+    are independent of each other, so their lines interleave instead of
+    sharing baselines.
+    """
+    column = max(text_right - text_left, 1.0)
+    split = text_left + column * CAPTION_COLUMN_SHARE
+
+    left: list = []
+    right: list = []
+    for _, line in lines:
+        (right if line.bbox.x0 >= split else left).append(line)
+    if len(left) < CAPTION_MIN_LINES or len(right) < CAPTION_MIN_LINES:
+        return None
+
+    # The caption is the *first contiguous run* of the right-hand column. It
+    # is bounded on the right column rather than on the overlap of the two,
+    # because the left column carries straight on into the body text below;
+    # and the run stops at the first large vertical gap, because a page
+    # footer ("Page 1") also sits to the right of the split and would
+    # otherwise stretch the caption over the whole page.
+    right.sort(key=lambda l: l.bbox.y0)
+    run = [right[0]]
+    for line in right[1:]:
+        if line.bbox.y0 - run[-1].bbox.y1 > CAPTION_MAX_GAP:
+            break
+        run.append(line)
+    right = run
+    if len(right) < CAPTION_MIN_LINES:
+        return None
+    top = min(l.bbox.y0 for l in right)
+    bottom = max(l.bbox.y1 for l in right)
+    if not any(l.bbox.y1 > top and l.bbox.y0 < bottom for l in left):
+        return None
+
+    # Only the overlapping band is the caption; text above or below it is
+    # ordinary body copy and stays on the paragraph path.
+    left = [l for l in left if l.bbox.y1 > top and l.bbox.y0 < bottom]
+    if len(left) < CAPTION_MIN_LINES or len(right) < CAPTION_MIN_LINES:
+        return None
+
+    # The columns must be *independent*, which is what a caption is and what
+    # separates it from a page of "Job Title .... Date" rows. In such a page
+    # each right-hand line sits on a left-hand line's baseline; in a caption
+    # the two columns are set to their own rhythms and mostly do not line up.
+    # Without this test a whole resume reads as one caption.
+    paired = sum(1 for r in right
+                 if any(abs(r.bbox.y0 - l.bbox.y0) <= SAME_ROW_TOLERANCE
+                        for l in left))
+    if paired > len(right) * CAPTION_MAX_PAIRED_SHARE:
+        return None
+    return left, right
+
+
 def extract_structure(page: Page, qa: QAReport,
                       source: Optional["fitz.Page"] = None) -> list[DocBlock]:
     """Read a page as a sequence of semantic blocks.
@@ -322,6 +482,18 @@ def extract_structure(page: Page, qa: QAReport,
     if not lines:
         return []
 
+    # Read the page in the order it is *seen*, not the order the producer
+    # happened to store it in. A PDF's content stream carries no guarantee of
+    # sequence, and a template-built CV routinely writes its section titles
+    # last - so taken as stored, every heading on the page piled up at the
+    # foot of it, stranded from the content it introduces, while that content
+    # ran together under whichever heading came before.
+    #
+    # Lines sharing a baseline keep their left-to-right order, so the cells of
+    # a row still arrive in sequence for the grouping passes below.
+    lines.sort(key=lambda pair: (round(pair[1].bbox.y0 / SAME_ROW_TOLERANCE),
+                                 pair[1].bbox.x0))
+
     # Tables are lifted out whole. Their cell text and their ruling lines are
     # then withheld from everything below, so a grid is not also emitted as a
     # run of paragraphs with stray rules between them.
@@ -334,37 +506,78 @@ def extract_structure(page: Page, qa: QAReport,
 
     text_left = min(l.bbox.x0 for _, l in lines)
     text_right = max(l.bbox.x1 for _, l in lines)
+    # Kept before the row grouping below removes the cells it consumes, so the
+    # centring test can still see that a line had neighbours on its baseline.
+    all_lines = [l for _, l in lines]
 
     rules = [r for r in _section_rules(page, text_left, text_right)
              if not any(box.y0 - 2 <= r[0] <= box.y1 + 2 for box, _, _ in tables)]
 
-    # A producer often sets "Job Title .... Date" as two separate lines that
-    # share a baseline: the title flush left, the trailing half flush right.
-    # PyMuPDF reports them as two lines, so they are paired here before
-    # anything else looks at them - left alone they become two paragraphs and
-    # the trailing half wraps into a narrow column of its own.
+    # A caption sets two independent columns side by side: the parties down
+    # the left, the document's own labels down the right. Its lines interleave
+    # rather than pair off, so neither the row grouping below nor the
+    # paragraph run can read it - flattened in document order the two columns
+    # comb together into nonsense ("Index No. Date Action Commenced:
+    # Defendant."). It is lifted out first, as one block holding each column
+    # whole.
+    caption_lines: set[int] = set()
+    caption_block: Optional[DocBlock] = None
+    caption_y = 0.0
+    region = _caption_region(lines, text_left, text_right)
+    if region:
+        left_col, right_col = region
+        caption_y = min(l.bbox.y0 for l in left_col + right_col)
+        caption_block = DocBlock(
+            kind="two_sided",
+            fragments=_column_fragments(left_col),
+            right=_column_fragments(right_col),
+            caption=True,
+        )
+        caption_lines = {id(l) for l in left_col + right_col}
+        lines = [pair for pair in lines if id(pair[1]) not in caption_lines]
+
+    # A producer often sets "Job Title .... Date" as separate lines that share
+    # a baseline: the title flush left, the trailing half flush right. PyMuPDF
+    # reports them as separate lines, so they are grouped here before anything
+    # else looks at them - left alone they become separate paragraphs and each
+    # trailing half wraps into a narrow column of its own.
+    #
+    # A row is *every* line on that baseline, not just the first two. A CV
+    # banner ("Place of birth: ... | Nationality: ... | Gender: ... | Phone
+    # number:") and a court caption both set three or more cells across one
+    # row; pairing only the first with the last left the cells between them to
+    # be emitted as stray paragraphs in the middle of the header.
     column = max(text_right - text_left, 1.0)
-    trailing_for: dict[int, Any] = {}      # id(line) -> the line to its right
+    row_cells: dict[int, list[Any]] = {}   # id(first line) -> lines after it
     consumed: set[int] = set()
     for i, (_, first) in enumerate(lines):
         if id(first) in consumed:
             continue
+        rest: list[Any] = []
+        cursor = first
         for j in range(i + 1, len(lines)):
             second = lines[j][1]
             if id(second) in consumed:
                 continue
             if abs(second.bbox.y0 - first.bbox.y0) > SAME_ROW_TOLERANCE:
                 continue
-            if second.bbox.x0 <= first.bbox.x1:
+            if second.bbox.x0 <= cursor.bbox.x1:
                 continue
-            right_spans = [sp for sp in second.spans if sp.text.strip()]
-            if not right_spans:
+            if not [sp for sp in second.spans if sp.text.strip()]:
                 continue
-            if (right_spans[-1].bbox.x1 - text_left) / column < RIGHT_EDGE_SHARE:
-                continue
-            trailing_for[id(first)] = second
-            consumed.add(id(second))
-            break
+            rest.append(second)
+            cursor = second
+        if not rest:
+            continue
+        # The row must actually span the column. A line broken into two by a
+        # font change mid-sentence also shares a baseline, and turning that
+        # into a two-column row would push its own tail to the far margin.
+        last_spans = [sp for sp in rest[-1].spans if sp.text.strip()]
+        if (last_spans[-1].bbox.x1 - text_left) / column < RIGHT_EDGE_SHARE:
+            continue
+        row_cells[id(first)] = rest
+        for line in rest:
+            consumed.add(id(line))
 
     lines = [pair for pair in lines if id(pair[1]) not in consumed]
 
@@ -374,7 +587,8 @@ def extract_structure(page: Page, qa: QAReport,
         kind, meta = _classify(line, body, page.width, text_left, text_right)
         if kind == "heading":
             heading_sizes.add(round(meta.get("size", body), 1))
-        meta["centred"] = _is_centred(line, text_left, text_right)
+        meta["centred"] = _is_centred(line, text_left, text_right,
+                                      all_lines)
         meta["y"] = line.bbox.y0
         meta["block"] = id(owner)
         meta["solo"] = len([l for l in owner.lines if _line_text(l).strip()]) == 1
@@ -403,6 +617,33 @@ def extract_structure(page: Page, qa: QAReport,
     table_at = 0
     rule_at = 0
 
+    # Images are placed by where they sit on the page, in step with the text,
+    # rather than being appended after it. A header photograph sits above the
+    # first line of a CV; emitted last it landed at the foot of the page's
+    # content and reflow then carried it onto the following page.
+    pending_images = sorted(
+        (im for im in page.images if im.data), key=lambda im: im.bbox.y0)
+    image_at = 0
+
+    def emit_images_above(y: float) -> None:
+        nonlocal image_at
+        # A floated image is emitted *before* the text that wraps beside it,
+        # so its placement allows for a header line that starts fractionally
+        # above the image's own top edge.
+        while image_at < len(pending_images) and (
+                pending_images[image_at].bbox.y0
+                - (IMAGE_FLOAT_LEAD
+                   if _float_side(pending_images[image_at], all_lines)
+                   else 0.0)) <= y:
+            flush_paragraph()
+            image = pending_images[image_at]
+            blocks.append(DocBlock(kind="image", image=image.data,
+                                   image_ext=image.ext or "png",
+                                   width=image.bbox.width,
+                                   height=image.bbox.height,
+                                   float_side=_float_side(image, all_lines)))
+            image_at += 1
+
     def emit_tables_above(y: float) -> None:
         nonlocal table_at
         while table_at < len(pending_tables) and pending_tables[table_at][0].y0 <= y:
@@ -410,6 +651,14 @@ def extract_structure(page: Page, qa: QAReport,
             box, rows, header = pending_tables[table_at]
             blocks.append(DocBlock(kind="table", rows=rows, header=header))
             table_at += 1
+
+    def emit_caption_above(y: float) -> None:
+        """Place the caption block at the point its own lines occupied."""
+        nonlocal caption_block
+        if caption_block is not None and caption_y <= y:
+            flush_paragraph()
+            blocks.append(caption_block)
+            caption_block = None
 
     def emit_rules_above(y: float) -> None:
         """Place any section rule that sits above this line, in order."""
@@ -420,10 +669,13 @@ def extract_structure(page: Page, qa: QAReport,
             rule_at += 1
 
     for index, (kind, meta, line) in enumerate(classified):
+        emit_caption_above(meta.get("y", 0.0))
+        emit_images_above(meta.get("y", 0.0))
         emit_rules_above(meta.get("y", 0.0))
         emit_tables_above(meta.get("y", 0.0))
         spans = [s for s in line.spans if s.text]
-        trailing = trailing_for.get(id(line))
+        trailing_cells = row_cells.get(id(line))
+        trailing = trailing_cells[0] if trailing_cells else None
 
         if kind == "heading" and trailing is None:
             flush_paragraph()
@@ -431,13 +683,18 @@ def extract_structure(page: Page, qa: QAReport,
             blocks.append(DocBlock(kind="heading", fragments=_fragments(spans),
                                    level=level,
                                    centred=bool(meta.get("centred"))))
-        elif trailing is not None:
-            # Paired with the line sharing its baseline.
+        elif trailing_cells:
+            # Grouped with every line sharing its baseline.
             flush_paragraph()
+            rest = [_fragments([sp for sp in cell.spans if sp.text])
+                    for cell in trailing_cells]
+            # `right` is the far end of the row, so it takes the *last* cell;
+            # anything between the two ends keeps its order in `extra`.
             blocks.append(DocBlock(
                 kind="two_sided",
                 fragments=_fragments(spans),
-                right=_fragments([sp for sp in trailing.spans if sp.text]),
+                right=rest[-1],
+                extra=rest[:-1],
             ))
         elif kind == "bullet":
             flush_paragraph()
@@ -504,16 +761,10 @@ def extract_structure(page: Page, qa: QAReport,
                 pending[-1].text += " "
             pending.extend(_fragments(spans))
     flush_paragraph()
+    emit_caption_above(float("inf"))
     emit_rules_above(float("inf"))
     emit_tables_above(float("inf"))
-
-    for image in page.images:
-        if not image.data:
-            continue
-        blocks.append(DocBlock(kind="image", image=image.data,
-                               image_ext=image.ext or "png",
-                               width=image.bbox.width,
-                               height=image.bbox.height))
+    emit_images_above(float("inf"))
 
     qa.add(
         "structure",
@@ -655,9 +906,34 @@ li {{ margin: 0 0 0.25em; }}
   gap: 1.5em;
   margin: 0 0 0.35em;
 }}
-.two-sided .lead {{ flex: 1 1 auto; }}
-.two-sided .trail {{ flex: 0 0 auto; white-space: nowrap; }}
+.two-sided .lead {{ flex: 0 1 auto; }}
+.two-sided .cell {{ flex: 0 1 auto; }}
+.two-sided .trail {{ flex: 0 1 auto; }}
+/* A two-cell row is the "Job Title .... Date" case: the trailing half is a
+   date and must not be broken across lines. A row of three or more is a
+   banner of labelled fields, which has to be free to wrap. */
+.two-sided.pair .lead {{ flex: 1 1 auto; }}
+.two-sided.pair .trail {{ flex: 0 0 auto; white-space: nowrap; }}
+/* The cells of a banner are sized to their content and spread across the
+   row. They may wrap when the translation is too wide to fit, but each cell
+   wraps as a unit - a cell is a labelled field and splitting one across two
+   lines separates the label from its value. */
+.two-sided.row-wrap {{ flex-wrap: wrap; justify-content: flex-start;
+  gap: 0.35em 1.2em; }}
+.two-sided.row-wrap > span {{ flex: 0 1 auto; }}
+/* A caption is two independent columns of text, so each half takes half the
+   width and wraps inside it rather than being held on one line. */
+.two-sided.caption {{ align-items: flex-start; }}
+.two-sided.caption > span {{ flex: 1 1 0; white-space: normal; }}
 img {{ max-width: 100%; height: auto; display: block; margin: 0.6em 0; }}
+/* An image the source set alongside its text keeps the text beside it. The
+   float is on the start edge, so it moves to the right under dir=rtl without
+   any per-image logic. */
+img.float-start {{
+  float: inline-start;
+  margin: 0 0 0.5em 0;
+  margin-inline-end: 0.9em;
+}}
 table {{
   width: 100%;
   border-collapse: collapse;
@@ -764,16 +1040,26 @@ def _render_page(blocks: list[DocBlock], rtl: bool, base: float,
             out.append(f"<li>{_render_fragments(block.fragments, rtl, base, scale)}</li>")
         elif block.kind == "two_sided":
             lead = _render_fragments(block.fragments, rtl, base, scale)
+            cells = [f'<span class="lead">{lead}</span>']
+            for extra in block.extra:
+                cells.append(
+                    f'<span class="cell">'
+                    f'{_render_fragments(extra, rtl, base, scale)}</span>')
             trail = _render_fragments(block.right, rtl, base, scale)
-            out.append(
-                f'<div class="two-sided"><span class="lead">{lead}</span>'
-                f'<span class="trail">{trail}</span></div>'
-            )
+            cells.append(f'<span class="trail">{trail}</span>')
+            if block.caption:
+                klass = "two-sided caption"
+            elif block.extra:
+                klass = "two-sided row-wrap"
+            else:
+                klass = "two-sided pair"
+            out.append(f'<div class="{klass}">{"".join(cells)}</div>')
         elif block.kind == "image" and block.image:
             blob = base64.b64encode(block.image).decode("ascii")
             style = f"width:{block.width:.0f}pt" if block.width else ""
-            out.append(f'<img src="data:image/{block.image_ext};base64,{blob}"'
-                       f' style="{style}" alt="">')
+            klass = ' class="float-start"' if block.float_side else ""
+            out.append(f'<img{klass} src="data:image/{block.image_ext};'
+                       f'base64,{blob}" style="{style}" alt="">')
         else:
             inner = _render_fragments(block.fragments, rtl, base, scale)
             if inner.strip():
@@ -864,7 +1150,9 @@ def _translate_blocks(pages: list[list[DocBlock]], direction: str,
 
     for blocks in pages:
         for block in blocks:
-            for fragment in list(block.fragments) + list(block.right):
+            row_middle = [f for cell in block.extra for f in cell]
+            for fragment in (list(block.fragments) + row_middle
+                             + list(block.right)):
                 if should_translate(fragment.text, direction):
                     targets.append(fragment)
             for r, row in enumerate(block.rows):

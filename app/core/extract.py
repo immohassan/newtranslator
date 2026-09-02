@@ -31,6 +31,11 @@ FLAG_BOLD = 1 << 4
 
 # A drawing counts as an underline candidate if it is this thin (points).
 UNDERLINE_MAX_THICKNESS = 2.5
+# A drawing no thicker than this is a hairline rule rather than a filled shape.
+HAIRLINE_MAX_THICKNESS = 2.5
+# Hairlines whose tops fall within this many points of each other are the
+# passes of one bevelled rule, not separate lines.
+HAIRLINE_MERGE_TOLERANCE = 3.0
 # ...and sits within this vertical distance below a text baseline.
 UNDERLINE_MAX_GAP = 6.0
 # Horizontal overlap with the span required to bind them together.
@@ -131,6 +136,51 @@ def _extract_drawings(page: fitz.Page) -> list[DrawingElement]:
                 seqno=int(d.get("seqno") or 0),
             )
         )
+    return _dedupe_drawings(out)
+
+
+def _dedupe_drawings(drawings: list[DrawingElement]) -> list[DrawingElement]:
+    """Drop drawings that repeat one already kept.
+
+    A producer routinely emits the same rule several times over - once per
+    stroke pass, or once per style it was given - and the duplicates are
+    invisible in the source because they land exactly on top of one another.
+    They do not stay invisible: each copy is redrawn, and after a mirror the
+    copies no longer coincide, so one hairline becomes a stack of them.
+
+    An exact repeat - same geometry, same paint - is dropped outright. A
+    hairline sharing another's box is dropped too even when its colour
+    differs: a rule bevelled out of two or three greys stacked on the same
+    line reads as one line in the source, and only the first is needed to
+    reproduce it. Anything thicker keeps every copy, since a differently
+    coloured shape of real size is part of the artwork.
+    """
+    seen: set[tuple] = set()
+    hairlines: list[tuple] = []
+    out: list[DrawingElement] = []
+    for drawing in drawings:
+        box = drawing.bbox
+        key = (
+            round(box.x0, 2), round(box.y0, 2),
+            round(box.x1, 2), round(box.y1, 2),
+            drawing.kind, drawing.color, drawing.fill,
+            round(drawing.width, 3), drawing.close_path,
+            round(drawing.fill_opacity, 3), round(drawing.stroke_opacity, 3),
+        )
+        if key in seen:
+            continue
+        if box.height <= HAIRLINE_MAX_THICKNESS and box.width > box.height:
+            # Compared by distance rather than by bucket: the passes of a
+            # bevelled rule are drawn a fraction of a point apart, and a
+            # bucket boundary falling between two of them would keep both.
+            span = (round(box.x0), round(box.x1))
+            if any(other == span
+                   and abs(y - box.y0) <= HAIRLINE_MERGE_TOLERANCE
+                   for other, y in hairlines):
+                continue
+            hairlines.append((span, box.y0))
+        seen.add(key)
+        out.append(drawing)
     return out
 
 

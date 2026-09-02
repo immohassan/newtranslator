@@ -87,3 +87,40 @@ def test_unsupported_type_rejected(tmp_path):
     path.write_text("hello")
     with pytest.raises(ValueError, match="Unsupported file type"):
         extract(str(path), QAReport())
+
+
+def test_repeated_drawings_are_collapsed():
+    """A rule drawn several times over must reach the page once.
+
+    Producers emit the same rule per stroke pass, and bevel one out of two or
+    three greys stacked on the same line. The copies coincide in the source so
+    they are invisible there, but each is redrawn on rebuild and a mirror
+    pulls them apart - one hairline becomes a stack of them.
+    """
+    from app.core.extract import _dedupe_drawings
+    from app.core.models import BBox, DrawingElement
+
+    def rule(y, fill):
+        return DrawingElement(bbox=BBox(28, y, 581, y + 1.5), kind="path",
+                              fill=fill)
+
+    # The three passes of one bevelled rule.
+    bevelled = [rule(115.0, (151, 151, 151)), rule(115.4, (170, 170, 170)),
+                rule(116.0, (85, 85, 85))]
+    assert len(_dedupe_drawings(bevelled)) == 1
+
+    # Rules at genuinely different places all survive.
+    separate = [rule(115, (0, 0, 0)), rule(201, (0, 0, 0)),
+                rule(262, (0, 0, 0))]
+    assert len(_dedupe_drawings(separate)) == 3
+
+    # A filled shape of real size is artwork: differently coloured copies are
+    # part of the design and are all kept.
+    panels = [DrawingElement(bbox=BBox(28, 300, 200, 380), kind="path",
+                             fill=(c, c, c)) for c in (10, 120, 250)]
+    assert len(_dedupe_drawings(panels)) == 3
+
+    # An exact repeat is dropped whatever its size.
+    same = [DrawingElement(bbox=BBox(28, 300, 200, 380), kind="path",
+                           fill=(10, 10, 10)) for _ in range(3)]
+    assert len(_dedupe_drawings(same)) == 1

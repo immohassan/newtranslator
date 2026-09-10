@@ -228,8 +228,21 @@ def _is_directional_image(bbox: BBox, data: bytes) -> bool:
 
 
 def _extract_images(doc: fitz.Document, page: fitz.Page, qa: QAReport) -> list[ImageElement]:
+    """Every image on the page, once per place it is drawn.
+
+    Keyed on position rather than on (xref, position). When a page draws the
+    same artwork several times - a row of identical icons, a repeated rule -
+    the copies may be stored as separate xrefs holding identical bytes, and
+    `get_image_rects` then reports *every* one of those positions for *every*
+    one of those xrefs. Keyed by xref the pairs all look distinct, so each
+    position is emitted once per xref: a template with 42 such icons yielded
+    1238 image blocks stacked on 42 spots, which reflowed into a column of
+    repeated marks running over twenty pages.
+
+    A position holds one image whichever xref claims it, so that is the key.
+    """
     images: list[ImageElement] = []
-    seen: set[tuple[int, tuple]] = set()
+    seen: set[tuple] = set()
     for info in page.get_images(full=True):
         xref = info[0]
         try:
@@ -252,7 +265,8 @@ def _extract_images(doc: fitz.Document, page: fitz.Page, qa: QAReport) -> list[I
             )
             continue
         for rect in rects:
-            key = (xref, (round(rect.x0, 2), round(rect.y0, 2)))
+            key = (round(rect.x0, 1), round(rect.y0, 1),
+                   round(rect.x1, 1), round(rect.y1, 1))
             if key in seen:
                 continue
             seen.add(key)

@@ -102,6 +102,9 @@ async def create_job(
     underline: str = Form("true"),
     flip_images: str = Form("true"),
     html_engine: str = Form("true"),
+    # Defaults to empty rather than "false": unset means "whatever the
+    # environment says", which is how a deployment turns this on globally.
+    vision_layout: str = Form(""),
     user: str = Depends(require_user),
 ):
     filename = os.path.basename(file.filename or "document")
@@ -134,6 +137,9 @@ async def create_job(
         underline=flag(underline),
         flip_directional_images=flag(flip_images),
         html_engine=flag(html_engine),
+        # Omitted rather than passed as False, so an unset form field leaves
+        # the environment's default in force instead of overriding it off.
+        **({"vision_layout": True} if flag(vision_layout) else {}),
     )
     job = store.create(user, filename, data, options)
     log.info("Job %s queued by %s (%s, %s)", job.id, user, filename, direction)

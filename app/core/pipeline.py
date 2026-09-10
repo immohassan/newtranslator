@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Callable, Optional
 
 from . import translate as translate_mod
@@ -43,6 +43,15 @@ class TranslationOptions:
     # Arrows and other left-to-right progression graphics read backwards after a
     # mirror unless their content is flipped too.
     flip_directional_images: bool = True
+    # Read each page's layout with a vision model rather than inferring it from
+    # the geometry. The geometric reader works out what a page is from gaps and
+    # alignment, which cannot see a sidebar - a two-column CV reads as one
+    # interleaved run. The model is shown the page and asked only where the
+    # text goes; the text itself always comes from the file. Off by default:
+    # it costs an API call per page, and falls back per page when unavailable.
+    vision_layout: bool = field(
+        default_factory=lambda: os.environ.get(
+            "VISION_LAYOUT", "").strip().lower() in ("1", "true", "yes", "on"))
 
 
 def _noop(stage: str, percent: int, message: str) -> None:
@@ -159,7 +168,8 @@ def run_pipeline(
     if use_html:
         from .html_pipeline import run_html_pipeline
 
-        run_html_pipeline(doc, output_path, options.direction, qa)
+        run_html_pipeline(doc, output_path, options.direction, qa,
+                          vision=options.vision_layout)
         progress("done", 100, "Done")
         return qa
 

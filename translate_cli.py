@@ -35,6 +35,13 @@ def main() -> int:
                              "The coordinate path cannot push content down when "
                              "a translation grows, so dense documents overlap; "
                              "use it only if a browser is unavailable.")
+    parser.add_argument("--vision-layout", action="store_true",
+                        help="read each page's layout with a vision model "
+                             "instead of inferring it from the geometry. The "
+                             "geometric reader cannot see a sidebar, so a "
+                             "two-column CV reads as one interleaved run. Uses "
+                             "whichever API key is set; costs one call per "
+                             "page. Also settable with VISION_LAYOUT=true.")
     parser.add_argument("--no-underline", action="store_true",
                         help="drop underlines (uncommon in Arabic typography)")
     parser.add_argument("--no-flip-images", action="store_true",
@@ -63,6 +70,9 @@ def main() -> int:
         html_engine=not args.no_html,
         underline=not args.no_underline,
         flip_directional_images=not args.no_flip_images,
+        # The flag turns it on; without it the environment decides, so a
+        # deployment can enable it once rather than per invocation.
+        **({"vision_layout": True} if args.vision_layout else {}),
     )
 
     print(f"Provider: {provider_name()}")

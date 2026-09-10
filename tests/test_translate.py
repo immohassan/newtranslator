@@ -258,3 +258,28 @@ def test_batch_prompt_keys_every_paragraph():
     prompt = T._batch_prompt(["first", "second", "third"], "en2ar")
     assert '"0"' in prompt and '"1"' in prompt and '"2"' in prompt
     assert "English" in prompt and "Arabic" in prompt
+
+
+def test_openrouter_provider_reaches_claude_over_the_openai_protocol(monkeypatch):
+    """OpenRouter is the OpenAI client pointed at a different endpoint."""
+    from app.core.translate import OpenRouterProvider
+
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-test")
+    monkeypatch.delenv("OPENROUTER_MODEL", raising=False)
+    provider = OpenRouterProvider()
+    assert provider.name == "openrouter"
+    assert "claude" in provider.model
+    assert "openrouter.ai" in str(provider._client.base_url)
+
+
+def test_openrouter_is_picked_up_when_it_is_the_only_key(monkeypatch):
+    from app.core import translate
+
+    for name in ("TRANSLATION_PROVIDER", "OPENAI_API_KEY", "ANTHROPIC_API_KEY"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-test")
+    translate.set_provider(None)
+    try:
+        assert translate.get_provider().name == "openrouter"
+    finally:
+        translate.set_provider(None)

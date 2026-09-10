@@ -54,6 +54,54 @@ def clean_translation(text: str) -> str:
     return out
 
 
+# A heading a template set with letter-spacing extracts as "D E T A I L S":
+# the tracking is real spaces between the glyphs, not a style the file records.
+# Sent on as-is it is translated letter by letter, and in Arabic the injected
+# spaces are worse than cosmetic - they break the cursive join, so the word
+# renders as a row of disconnected letterforms. The run is closed up before
+# translation, which is the only point where the damage can still be undone.
+#
+# The test is deliberately narrow. A run must be at least this many
+# single-character tokens in a row before it is read as tracking, so ordinary
+# prose - "a", "I", initials in "J. R. R. Tolkien" - is never touched.
+_TRACKED_MIN_RUN = 4
+# Tracking separates the letters of one word by a single space and its words by
+# a wider gap, so a run is matched only across single spaces. That keeps the
+# word break in "E M P L O Y M E N T  H I S T O R Y" intact - each word closes
+# up on its own - instead of fusing the two into one.
+_TRACKED_RE = re.compile(
+    r"(?<!\S)((?:[^\W\d_] ){%d,}[^\W\d_])(?!\S)" % (_TRACKED_MIN_RUN - 1)
+)
+
+
+def _untrack(text: str) -> str:
+    """Close up a run of letter-spaced characters into a word.
+
+    "D E T A I L S" -> "DETAILS". Runs of two or fewer are left alone, and a
+    tracked run inside a longer line is closed without disturbing the rest of
+    it, so "E M P L O Y M E N T  H I S T O R Y" becomes two words rather than
+    one. Text with no such run is returned unchanged.
+    """
+    if not text or text.count(" ") < _TRACKED_MIN_RUN - 1:
+        return text
+
+    def close(match: "re.Match[str]") -> str:
+        run = match.group(1)
+        letters = run.split()
+        # Tracking is set in one case throughout. Mixed case is a genuine run
+        # of short words, not a spaced-out word.
+        if any(c.isupper() for c in run) and any(c.islower() for c in run):
+            return run
+        return "".join(letters)
+
+    out = _TRACKED_RE.sub(close, text)
+    if out == text:
+        return text
+    # The wider gap that separated two tracked words is now an ordinary double
+    # space between them, so it is closed to one.
+    return re.sub(r" {2,}", " ", out)
+
+
 def _is_translatable(text: str, direction: Optional[str] = None) -> bool:
     """Whether a segment should be sent to the translator.
 
@@ -145,6 +193,10 @@ class OpenAIProvider(TranslationProvider):
 
     name = "openai"
     MODEL = "gpt-4o"
+    # Left unset here: OpenAI bills what a reply actually uses, so a ceiling
+    # only risks truncating a long batch. Subclasses whose host reserves
+    # credit up front override it.
+    MAX_TOKENS: Optional[int] = None
 
     def __init__(self, api_key: Optional[str] = None, model: Optional[str] = None):
         self.api_key = api_key or os.environ.get("OPENAI_API_KEY", "")
@@ -172,10 +224,65 @@ class OpenAIProvider(TranslationProvider):
                 ],
                 response_format={"type": "json_object"},
                 temperature=0.2,
+                **({"max_tokens": self.MAX_TOKENS} if self.MAX_TOKENS else {}),
             )
         except Exception as exc:
+            # "OpenAI" here names the *protocol*, which is what OpenRouter
+            # speaks too; the failure text itself carries the endpoint.
             raise TranslationError(f"OpenAI request failed: {exc}")
         return _parse_batch_response(response.choices[0].message.content or "", texts)
+
+
+class OpenRouterProvider(OpenAIProvider):
+    """Any model OpenRouter hosts - Claude included - over its OpenAI-shaped API.
+
+    OpenRouter speaks the OpenAI chat-completions protocol, so the whole of
+    `OpenAIProvider` applies unchanged and only the endpoint, the key and the
+    model name differ. Reaching Claude this way avoids the Anthropic account
+    setup entirely: an OpenRouter key is never workspace-scoped, which is the
+    thing that blocked the direct route.
+    """
+
+    name = "openrouter"
+    MODEL = "anthropic/claude-opus-4.1"
+    BASE_URL = "https://openrouter.ai/api/v1"
+    # OpenRouter reserves credit for the *whole* of max_tokens before the
+    # request runs, not for what it turns out to use, and with none set the
+    # model's own ceiling applies - 32k for Claude, which is refused outright
+    # on a small balance. A batch is capped at MAX_BATCH_CHARS of input, so
+    # the reply cannot be anywhere near that: this is the real ceiling, and
+    # setting it is what keeps the reservation proportionate.
+    MAX_TOKENS = 8000
+
+    def __init__(self, api_key: Optional[str] = None, model: Optional[str] = None):
+        self.api_key = api_key or os.environ.get("OPENROUTER_API_KEY", "")
+        self.model = model or os.environ.get("OPENROUTER_MODEL", self.MODEL)
+        if not self.api_key:
+            raise TranslationError("OPENROUTER_API_KEY is not set.")
+        try:
+            from openai import OpenAI
+        except ImportError as exc:
+            raise TranslationError(f"the openai package is not installed: {exc}")
+        self._client = OpenAI(
+            api_key=self.api_key,
+            base_url=os.environ.get("OPENROUTER_BASE_URL", self.BASE_URL),
+            timeout=120.0, max_retries=MAX_RETRIES,
+            # OpenRouter attributes requests to an app by these headers. They
+            # are optional, and sent only when configured.
+            default_headers=_openrouter_headers(),
+        )
+
+
+def _openrouter_headers() -> dict[str, str]:
+    """The optional attribution headers OpenRouter reads, if they are set."""
+    headers = {}
+    referer = os.environ.get("OPENROUTER_SITE_URL", "").strip()
+    title = os.environ.get("OPENROUTER_APP_NAME", "").strip()
+    if referer:
+        headers["HTTP-Referer"] = referer
+    if title:
+        headers["X-Title"] = title
+    return headers
 
 
 class AnthropicProvider(TranslationProvider):
@@ -194,8 +301,15 @@ class AnthropicProvider(TranslationProvider):
         except ImportError as exc:
             raise TranslationError(f"the anthropic package is not installed: {exc}")
         # The SDK retries 429/5xx with backoff itself.
-        self._client = anthropic.Anthropic(api_key=self.api_key, timeout=120.0,
-                                           max_retries=MAX_RETRIES)
+        #
+        # An identity-linked key is scoped to a workspace and the API rejects a
+        # request that does not name one, so the header is sent whenever the
+        # id is configured. Ordinary keys need no workspace and ignore it.
+        workspace = os.environ.get("ANTHROPIC_WORKSPACE_ID", "").strip()
+        self._client = anthropic.Anthropic(
+            api_key=self.api_key, timeout=120.0, max_retries=MAX_RETRIES,
+            default_headers=({"anthropic-workspace-id": workspace}
+                             if workspace else None))
 
     def translate_batch(self, texts: list[str], direction: str) -> list[str]:
         src, dst = DIRECTION_LABELS[direction]
@@ -284,6 +398,7 @@ class DeepLProvider(TranslationProvider):
 _PROVIDERS: dict[str, type[TranslationProvider]] = {
     "echo": EchoProvider,
     "openai": OpenAIProvider,
+    "openrouter": OpenRouterProvider,
     "anthropic": AnthropicProvider,
     "google": GoogleProvider,
     "deepl": DeepLProvider,
@@ -303,6 +418,8 @@ def get_provider() -> TranslationProvider:
             name = "openai"
         elif os.environ.get("ANTHROPIC_API_KEY"):
             name = "anthropic"
+        elif os.environ.get("OPENROUTER_API_KEY"):
+            name = "openrouter"
         else:
             name = "echo"
     cls = _PROVIDERS.get(name, EchoProvider)
@@ -341,6 +458,11 @@ def translate_batch(
     """
     if direction not in DIRECTION_LABELS:
         raise ValueError(f"Unknown direction '{direction}'.")
+
+    # Letter-spaced runs are closed up before anything else looks at the text.
+    # A tracked heading is otherwise translated character by character, and in
+    # Arabic the spaces between those characters break the cursive join.
+    texts = [_untrack(t) for t in texts]
 
     results = list(texts)
     indices = [i for i, t in enumerate(texts) if _is_translatable(t, direction)]

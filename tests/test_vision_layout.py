@@ -268,34 +268,3 @@ def test_openrouter_defaults_to_a_claude_model(monkeypatch):
     monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-test")
     monkeypatch.delenv("VISION_LAYOUT_MODEL", raising=False)
     assert "claude" in vision_layout.OpenRouterReader().model
-
-
-def test_the_pages_images_are_not_dropped(page, source):
-    """The model answers about text only - the pictures must survive anyway.
-
-    Nothing in the reply mentions an image, so a reader that emits only what
-    the model named loses every one of them: this is what left a rebuilt CV
-    with no portrait and no contact icons.
-    """
-    from app.core.models import BBox, ImageElement
-
-    page.images = [ImageElement(bbox=BBox(40, 36, 90, 86), data=b"PNGDATA",
-                                ext="png")]
-    blocks = read_structure(page, QAReport(), source,
-                            client=_client(_one_column(page)))
-    images = [b for b in blocks if b.kind == "image"]
-    assert len(images) == 1
-    assert images[0].image == b"PNGDATA"
-
-
-def test_an_image_lands_beside_the_text_it_sits_next_to(page, source):
-    """Placed by position, not appended: a portrait belongs at the top."""
-    from app.core.models import BBox, ImageElement
-
-    page.images = [ImageElement(bbox=BBox(40, 0, 90, 20), data=b"TOP",
-                                ext="png")]
-    blocks = read_structure(page, QAReport(), source,
-                            client=_client(_one_column(page)))
-    kinds = [b.kind for b in blocks]
-    # The image sits above every text block on the page, so it comes first.
-    assert kinds.index("image") < kinds.index("paragraph")

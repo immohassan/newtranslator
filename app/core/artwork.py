@@ -138,7 +138,6 @@ class Artwork:
     # Drawings with no owner, kept for the fixed layer at their own positions.
     loose: list[DrawingElement] = field(default_factory=list)
 
-
     def __bool__(self) -> bool:
         return bool(self.ratings or self.panels or self.banners
                     or self.frames or self.loose)
@@ -285,37 +284,6 @@ def _frame_sides(drawings: list[DrawingElement]) -> list[Frame]:
             frames.append(Frame(bbox=span, color=left.color or (0, 0, 0),
                                 width=max(left.width, 0.6)))
     return frames
-
-
-def pip_images(page: Page) -> list:
-    """Images that are really rating pips, and are drawn as vectors as well.
-
-    A template can lay its pips down twice: a small PNG per pip *and* the same
-    row stroked as vector paths on top. The vector row is what `read_artwork`
-    reads a score from, so the images are redundant - but the structure pass
-    turns every image into a block of its own, which put thirty-five loose red
-    dashes through the rebuilt text.
-
-    Only an image that sits under a vector pip is returned, so a template
-    whose pips are images *alone* keeps them: there the picture is the only
-    record of the score, and dropping it would lose the rating entirely.
-    """
-    vectors = [d for d in page.drawings if _is_pip(d)]
-    if not vectors:
-        return []
-
-    doubled = []
-    for image in page.images:
-        box = image.bbox
-        if box.width > PIP_MAX_SIZE or box.height > PIP_MAX_SIZE:
-            continue
-        if min(box.width, box.height) > PIP_MAX_THICKNESS:
-            continue
-        if any(abs(v.bbox.x0 - box.x0) <= PIP_MAX_SIZE
-               and abs(v.bbox.y0 - box.y0) <= PIP_ROW_TOLERANCE
-               for v in vectors):
-            doubled.append(image)
-    return doubled
 
 
 def read_artwork(page: Page) -> Artwork:

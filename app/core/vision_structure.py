@@ -21,8 +21,6 @@ from .html_pipeline import (
     _BULLET_RE,
     _ORDERED_RE,
     _body_size,
-    _find_tables,
-    _inside,
     extract_structure,
 )
 from .models import Page
@@ -64,28 +62,13 @@ def _fragments_for(block, strip_marker: bool) -> list[Fragment]:
     return out
 
 
-def _to_doc_block(entry: dict, page: Page,
-                  tables: list = ()) -> Optional[DocBlock]:
-    """One entry of the model's answer, as a renderable block.
-
-    A block whose text is already inside a grid is dropped: the grid is
-    emitted whole from its own ruling lines, and letting the cell text through
-    here as well would print every cell twice - once in the table and once as
-    a paragraph beside it.
-    """
+def _to_doc_block(entry: dict, page: Page) -> Optional[DocBlock]:
+    """One entry of the model's answer, as a renderable block."""
     block = page.blocks[entry["id"]]
-    # Kept so the page's images can be slotted back in beside the text they
-    # sit next to; the model is never asked about them.
-    source_box = block.bbox
     kind = entry["kind"]
 
-    if tables and any(_inside(source_box, box) for box, _, _ in tables):
-        return None
-
     if kind == "rule":
-        out = DocBlock(kind="rule")
-        out.source_box = source_box
-        return out
+        return DocBlock(kind="rule")
 
     listish = kind == "bullet"
     fragments = _fragments_for(block, strip_marker=listish)
@@ -93,73 +76,15 @@ def _to_doc_block(entry: dict, page: Page,
         return None
 
     if kind == "heading":
-        out = DocBlock(kind="heading", fragments=fragments,
-                       level=min(max(int(entry.get("level") or 2), 1), 4))
-        out.source_box = source_box
-        return out
+        return DocBlock(kind="heading", fragments=fragments,
+                        level=min(max(int(entry.get("level") or 2), 1), 4))
     if listish:
         ordered = bool(_ORDERED_RE.match(block.text))
-        out = DocBlock(kind="bullet", fragments=fragments, ordered=ordered)
-        out.source_box = source_box
-        return out
+        return DocBlock(kind="bullet", fragments=fragments, ordered=ordered)
     # A table row read as one block is set as a paragraph rather than being
     # rebuilt into a grid: the cells of a single row carry no column widths,
     # and inventing them is how a row becomes a mangled table.
-    out = DocBlock(kind="paragraph", fragments=fragments)
-    out.source_box = source_box
-    return out
-
-
-def _image_block(image) -> DocBlock:
-    """One of the page's pictures, as a block the renderer can emit."""
-    out = DocBlock(kind="image", image=image.data,
-                   image_ext=image.ext or "png",
-                   width=image.bbox.width, height=image.bbox.height)
-    out.source_box = image.bbox
-    return out
-
-
-def _interleave_images(blocks: list[DocBlock], page: Page) -> list[DocBlock]:
-    """Put the page's images back among the text, in reading order.
-
-    The vision reader answers about text blocks alone, so an image reaches
-    this point unplaced. Each is inserted before the first block that sits
-    below it on the source page - which is where a reader met it - and any
-    left over go at the end.
-    """
-    pictures = [image for image in page.images if image.data]
-    if not pictures:
-        return blocks
-
-    out: list[DocBlock] = []
-    pending = sorted(pictures, key=lambda im: (im.bbox.y0, im.bbox.x0))
-    for block in blocks:
-        box = getattr(block, "source_box", None)
-        while pending and box is not None and pending[0].bbox.y0 <= box.y0:
-            out.append(_image_block(pending.pop(0)))
-        out.append(block)
-    out.extend(_image_block(image) for image in pending)
-    return out
-
-
-def _splice_tables(blocks: list[DocBlock], tables: list) -> list[DocBlock]:
-    """Put each grid back among the text blocks, in reading order.
-
-    A table is placed before the first block that starts below its top edge,
-    mirroring how `_interleave_images` places the page's pictures. Any grid
-    that sits below every block goes at the end.
-    """
-    pending = sorted(tables, key=lambda t: t[0].y0)
-    out: list[DocBlock] = []
-    for block in blocks:
-        box = getattr(block, "source_box", None)
-        while pending and box is not None and pending[0][0].y0 <= box.y0:
-            _, rows, header = pending.pop(0)
-            out.append(DocBlock(kind="table", rows=rows, header=header))
-        out.append(block)
-    out.extend(DocBlock(kind="table", rows=rows, header=header)
-               for _, rows, header in pending)
-    return out
+    return DocBlock(kind="paragraph", fragments=fragments)
 
 
 def _column_width(column: dict, page: Page) -> float:
@@ -184,22 +109,13 @@ def read_structure(page: Page, qa: QAReport, source, client=None) -> list[DocBlo
         # fallback rather than an error: it is what runs with no API key.
         return extract_structure(page, qa, source)
 
-    # A grid is read from the page's ruling lines, not from the model: the
-    # reader is asked where text sits, and a row it returns as one block
-    # carries no column widths, so a table left to that path is flattened into
-    # paragraphs and its cells lose the cells beside them - the one structure
-    # that cannot survive being read as prose. The cells' own text is then
-    # withheld from the column pass below, so the grid is not also emitted as
-    # a run of paragraphs sitting underneath it.
-    tables = _find_tables(page, source) if source is not None else []
-
     blocks: list[DocBlock] = []
     for column in columns:
         width = _column_width(column, page)
         sidebar = (column.get("role") == "sidebar"
                    or (width and width <= page.width * SIDEBAR_MAX_SHARE))
         column_blocks = [b for b in
-                         (_to_doc_block(entry, page, tables) for entry in column["blocks"])
+                         (_to_doc_block(entry, page) for entry in column["blocks"])
                          if b is not None]
         if not column_blocks:
             continue
@@ -211,28 +127,8 @@ def read_structure(page: Page, qa: QAReport, source, client=None) -> list[DocBlo
             column_blocks[-1].column_end = True
         blocks.extend(column_blocks)
 
-    # The grids go back among the text, each before the first block that sits
-    # below it on the page - which is where a reader met it. A table is
-    # full-width page furniture, so it carries no column marks and is placed
-    # relative to the text rather than inside a column.
-    if tables:
-        blocks = _splice_tables(blocks, tables)
-
     if not blocks:
-        # A page that is nothing but its grid - a rota, a schedule, a form -
-        # leaves no text blocks behind, which is not a failure to read it.
-        # Falling back here would hand the page to the geometric reader and
-        # undo the grid that was just recovered.
-        if tables:
-            return [DocBlock(kind="table", rows=rows, header=header)
-                    for _, rows, header in sorted(tables, key=lambda t: t[0].y0)]
         return extract_structure(page, qa, source)
-
-    # The model is asked about text only, so nothing above has placed the
-    # page's pictures - and without this every one of them is dropped, which
-    # lost a CV its portrait and its contact icons. Each is put back beside
-    # the text it sits next to on the page.
-    blocks = _interleave_images(blocks, page)
 
     qa.add(
         "structure",

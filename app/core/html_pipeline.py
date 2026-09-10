@@ -152,10 +152,6 @@ class DocBlock:
     # the translation instead of being a rectangle at a fixed height.
     banner_start: Optional[tuple[int, int, int]] = None
     banner_end: bool = False
-    # Where this block sat on the source page. The vision reader keeps it so
-    # the page's images, which the model is never asked about, can be slotted
-    # back among the text in reading order.
-    source_box: Optional[BBox] = None
 
     @property
     def text(self) -> str:
@@ -715,7 +711,6 @@ def extract_structure(page: Page, qa: QAReport,
                                    image_ext=image.ext or "png",
                                    width=image.bbox.width,
                                    height=image.bbox.height,
-                                   source_box=image.bbox,
                                    float_side=_float_side(image, all_lines)))
             image_at += 1
 
@@ -909,131 +904,16 @@ def _render_fragments(fragments: list[Fragment], rtl_page: bool,
     return "".join(parts)
 
 
-def _main_column_end(blocks: list[DocBlock]) -> Optional[int]:
-    """Index of the block that closes the page's main column, if it has one.
-
-    A column runs from the block carrying its `column_start` to the next
-    `column_end` after it, so the two are paired by walking the list rather
-    than by assuming the main column is the first or the last.
-    """
-    current = ""
-    for index, block in enumerate(blocks):
-        if block.column_start:
-            current = block.column_start
-        if block.column_end:
-            if current == "main":
-                return index
-            current = ""
-    return None
-
-
-def _join_continuation_pages(
-        pages: list[list[DocBlock]]) -> list[list[DocBlock]]:
-    """Merge a page that continues a column into the page that opened it.
-
-    The pages are emitted as one continuous flow, but each is rendered on its
-    own and the column marks are decided per page: a page read as several
-    columns marks its first and last block, a page read as one marks nothing.
-    Rendered separately, a single-column page that follows a two-column one is
-    closed out of the flex row and set full width - stacked underneath both
-    columns rather than continuing the one it belongs to.
-
-    That is what turned a two-page CV into three. The sidebar and the main
-    column both ended with page one, and page two's text - the tail of the
-    main column - was laid out across the whole measure below them, taking a
-    page and a half to say what had taken half a page.
-
-    The continuation's blocks are appended to the *same* list as the column
-    they continue, so one `_render_page` call sees the whole column and closes
-    it once, in the right place. Moving the mark alone is not enough: the
-    closing tag has to be emitted by the call that opened it.
-    """
-    if len(pages) < 2:
-        return pages
-
-    joined: list[list[DocBlock]] = [list(pages[0])]
-    for blocks in pages[1:]:
-        target = joined[-1]
-        if (blocks and target
-                # A page that reads as its own columns starts a new layout.
-                and not any(b.column_start for b in blocks)
-                and any(b.column_end for b in target)):
-            # The continuation belongs to the *main* column, which is not
-            # necessarily the last one on the page: a CV sets the body first
-            # and the sidebar after it, so appending to the end of the list
-            # would drop page two's text under the sidebar instead of
-            # carrying on the column it continues. The blocks are spliced in
-            # where that column ends.
-            main_end = _main_column_end(target)
-            if main_end is not None:
-                target[main_end].column_end = False
-                for offset, block in enumerate(blocks, start=1):
-                    target.insert(main_end + offset, block)
-                target[main_end + len(blocks)].column_end = True
-                continue
-        joined.append(list(blocks))
-    return joined
-
-
-# The body size to fall back on when a document carries no usable span sizes.
-# The page's own margin, in inches. Bound to one name because the full-bleed
-# banner has to pull out by exactly this much to reach the paper's edge.
-PAGE_MARGIN_IN = 0.75
-
-DEFAULT_BODY_PT = 11.0
-# A rebuild is held within this much of the source's own body size. A template
-# may set body copy very small to fit a dense page; following it below this
-# would rebuild an unreadable document.
-MIN_BODY_PT = 8.0
-MAX_BODY_PT = 12.0
-
-
-def _source_body_size(pages: list[list[DocBlock]]) -> float:
-    """The body text size of the source, from the text it uses most.
-
-    Measured by weight of characters rather than by counting fragments, so a
-    page's few large headings cannot outvote the body copy underneath them.
-    """
-    weight: dict[float, int] = {}
-    for blocks in pages:
-        for block in blocks:
-            # Headings carry their own sizes and are what this must not follow.
-            if block.kind == "heading":
-                continue
-            for fragment in block.fragments:
-                size = round(fragment.size, 1)
-                if size > 0:
-                    weight[size] = weight.get(size, 0) + len(fragment.text)
-    if not weight:
-        return DEFAULT_BODY_PT
-    body = max(weight.items(), key=lambda item: item[1])[0]
-    return min(max(body, MIN_BODY_PT), MAX_BODY_PT)
-
-
 def build_html(pages: list[list[DocBlock]], direction: str, page_size: BBox,
-               qa: QAReport, fit: float = 1.0) -> str:
-    """Turn the extracted structure into a standalone HTML document.
-
-    `fit` tightens the whole page - type size and leading together - so a
-    rebuild that spilled just past the source's last page can be drawn back
-    onto it. 1.0 is the natural setting; see `_fit_to_source_pages`.
-    """
+               qa: QAReport) -> str:
+    """Turn the extracted structure into a standalone HTML document."""
     rtl = direction == "en2ar"
-    # Set from the source's own body text rather than a fixed 11pt. A template
-    # that sets its body at 9pt was being rebuilt a fifth larger, and on a page
-    # that was already full that alone pushed the tail of it onto another
-    # sheet. A document that carries no usable sizes falls back to 11pt.
-    base = _source_body_size(pages)
+    base = 11.0
     # Arabic reads smaller than Latin at the same point size, so it is set a
     # little larger; going the other way it is set smaller. Same rule the
     # coordinate pipeline applies per span, expressed once in CSS.
     scale = ((base + fontlib.ARABIC_SIZE_BONUS) / base if rtl
              else fontlib.AR_TO_EN_SIZE_SCALE)
-    scale *= fit
-    # Leading is tightened with the type, but only half as hard: squeezing the
-    # line boxes as much as the glyphs is what makes a shrunk page look
-    # cramped rather than merely smaller.
-    leading = 1.5 - (1.0 - fit) * 0.75
 
     width_in = page_size.width / 72.0
     height_in = page_size.height / 72.0
@@ -1063,8 +943,7 @@ def build_html(pages: list[list[DocBlock]], direction: str, page_size: BBox,
     # where the translation does - forcing a break there leaves one page half
     # empty and pushes its remainder onto the next. The content is emitted as
     # one flow and the renderer paginates it.
-    body_parts = [_render_page(blocks, rtl, base, scale)
-                  for blocks in _join_continuation_pages(pages)]
+    body_parts = [_render_page(blocks, rtl, base, scale) for blocks in pages]
 
     return f"""<!doctype html>
 <html lang="{'ar' if rtl else 'en'}" dir="{'rtl' if rtl else 'ltr'}">
@@ -1072,27 +951,14 @@ def build_html(pages: list[list[DocBlock]], direction: str, page_size: BBox,
 <meta charset="utf-8">
 <style>
 {faces}
-/* The vertical margin is set here because `@page` is the only box that
-   repeats on every printed page - body padding is applied once to the
-   whole flow, so a document set that way keeps its margin on page one
-   and runs off the top of every page after it. The sides are zero, and
-   the text's side margin is set on the body instead: that is what lets a
-   full-bleed masthead cancel it and reach the paper's edge. */
-@page {{ size: {width_in:.2f}in {height_in:.2f}in;
-        margin: {PAGE_MARGIN_IN}in 0; }}
+@page {{ size: {width_in:.2f}in {height_in:.2f}in; margin: 0.75in; }}
 html, body {{ margin: 0; padding: 0; }}
 body {{
-  /* Only the side margin is set here, so a full-bleed element can cancel it
-     with a negative margin of the same size. The top and bottom margin is
-     the printer's, because body padding applies once to the whole flow
-     rather than to every page. */
-  padding: 0 {PAGE_MARGIN_IN}in;
-  box-sizing: border-box;
   font-family: 'DocArabic', 'DocLatin', serif;
   font-size: {base * scale:.1f}pt;
   /* Real line boxes, computed by the layout engine, rather than a
      hand-rolled leading value. */
-  line-height: {leading:.3f};
+  line-height: 1.5;
   color: #000;
 }}
 h1, h2, h3, h4, h5, h6 {{ margin: 0.7em 0 0.3em; line-height: 1.3; }}
@@ -1137,38 +1003,8 @@ li {{ margin: 0 0 0.25em; }}
    the page's own padding - because a banner that stops at the text margin
    reads as a box, which is not what the source drew. */
 .banner {{
-  /* Full bleed. The band is pulled out by the page margin on three sides so
-     it runs to the paper's edge, as the source draws it: a header that stops
-     at the text margin reads as a box on the page rather than as the page's
-     own masthead. The margin is a fixed 0.75in, so the pull is too. */
-  /* Pulled up into the page's own top margin as well as out to both sides,
-     so the band starts at the paper's edge exactly as the source draws it. */
-  margin: -{PAGE_MARGIN_IN}in -{PAGE_MARGIN_IN}in 1.2em;
-  /* The padding puts back everything the negative margin just took: the sides
-     restore the text margin, so the words inside the band line up with the
-     columns below it, and the top restores the page margin the band was
-     pulled up through - without it the name and the portrait are dragged off
-     the top of the sheet along with the band. */
-  padding: calc({PAGE_MARGIN_IN}in + 0.6em) {PAGE_MARGIN_IN}in 1.4em;
-  /* The portrait sits beside the name, as the source sets it, rather than
-     above it: a stacked header is twice the height and reads as a different
-     design. `center` keeps the name level with the middle of the photo. */
-  display: flex;
-  align-items: center;
-  gap: 1em;
-  flex-wrap: wrap;
-}}
-/* The picture keeps its own size and never stretches to the flex line. */
-.banner img {{
-  flex: none;
-  border-radius: 50%;
-  object-fit: cover;
-}}
-/* The text beside the picture is one column of its own, so the name and the
-   title stack against each other rather than sitting side by side. */
-.banner-text {{
-  flex: 1 1 0;
-  min-width: 0;
+  margin: -0.75in -0.75in 1.2em;
+  padding: 1.4em 0.75in;
 }}
 /* Text colour is set per banner from its own fill - see `_open_banner` - so a
    pale band keeps dark text and only a dark one is reversed out. `!important`
@@ -1184,13 +1020,8 @@ li {{ margin: 0 0 0.25em; }}
 }}
 /* The body takes the room left over; the sidebar keeps its narrower measure,
    which is what makes it read as a sidebar rather than a second body. */
-/* `flex-basis` is the share of the row the body column starts from, rather
-   than `auto` - which sizes it from its content and lets a long unbreakable
-   word in the sidebar squeeze it toward nothing. That collapse is what set a
-   whole CV one word to a line, on about half of otherwise identical runs.
-   `min-width` is the floor it can never be squeezed below. */
-.column-main {{ flex: 1 1 60%; min-width: 50%; }}
-.column-sidebar {{ flex: 0 0 30%; min-width: 0; }}
+.column-main {{ flex: 1 1 auto; }}
+.column-sidebar {{ flex: 0 0 30%; }}
 /* One rule mirrors every "Job Title .... Date" row: under dir=rtl the two
    ends swap without any per-row logic. */
 .two-sided {{
@@ -1255,10 +1086,6 @@ hr.section-rule {{
   border-top: 0.75pt solid currentColor;
   margin: 0.15em 0 0.5em;
   opacity: 0.75;
-  /* A divider introduces what follows it, so it must not be the last thing on
-     a page: broken away from its section it reads as a line ruled under the
-     page rather than as the start of anything. */
-  break-after: avoid;
 }}
 /* Centred text stays centred whichever way the page reads. */
 .centred {{ text-align: center; }}
@@ -1368,56 +1195,6 @@ def _drop_buried_duplicates(page: Page, qa: QAReport) -> None:
     )
 
 
-def _consume_pip_images(page: Page) -> None:
-    """Take the images that are really rating pips out of the page.
-
-    Run before the structure is read, because that pass turns every remaining
-    image into a block of its own: a template that draws its pips as small
-    PNGs would otherwise scatter thirty-odd inline pictures through the text.
-    The pips themselves are re-read from `page.drawings` by `read_artwork`,
-    which is given the same images and groups them into rows.
-    """
-    from .artwork import pip_images
-
-    doubled = pip_images(page)
-    if not doubled:
-        return
-    taken = {id(image) for image in doubled}
-    page.images = [im for im in page.images if id(im) not in taken]
-
-
-# A coloured band at least this wide is the page's own masthead rather than
-# decoration inside one column, and is set across the top of the page.
-BANNER_PAGE_SPAN = 0.9
-
-
-def _hoist(blocks: list[DocBlock], run: list[DocBlock]) -> list[DocBlock]:
-    """Move `run` to the front of the page, keeping the columns well formed.
-
-    A hoisted block may be carrying the mark that opens or closes a column -
-    a CV's header is the first thing in its body column, so it holds the
-    `column_start`. Lifting it out with the mark still on it would open the
-    column outside the flex row and leave the rest of the column unwrapped,
-    so each mark is handed to the first block that stays behind.
-    """
-    lifted = [b for b in blocks if b in run]
-    rest = [b for b in blocks if b not in run]
-    if not rest:
-        return blocks
-
-    for block in lifted:
-        if block.column_start:
-            for other in rest:
-                if not other.column_start:
-                    other.column_start = block.column_start
-                    break
-            block.column_start = ""
-        if block.column_end:
-            block.column_end = False
-            rest[-1].column_end = True
-    return lifted + rest
-
-
 def attach_artwork(page: Page, blocks: list[DocBlock],
                    qa: QAReport) -> list[DocBlock]:
     """Give each block the artwork drawn for it.
@@ -1472,32 +1249,9 @@ def attach_artwork(page: Page, blocks: list[DocBlock],
                    if b is not None]
         if not covered:
             continue
-        # A picture inside the band belongs to it - a CV's portrait sits in
-        # its header - so any image whose place on the source page falls in
-        # the band is taken in too. Tested by position rather than by block
-        # order: the portrait is emitted above the name, so it sits outside
-        # the run the text alone would define.
-        inside = [b for b in blocks
-                  if b.kind == "image" and b not in covered
-                  and b.source_box is not None
-                  and _inside(b.source_box, banner.bbox)]
-        if inside:
-            # Only the largest: a header holds one portrait, and the contact
-            # icons that also sit in the band belong with their own lines.
-            covered.append(max(inside, key=lambda b: b.width * b.height))
-        covered.sort(key=blocks.index)
         covered[0].banner_start = banner.fill
         covered[-1].banner_end = True
         placed += 1
-        # A band that runs the width of the page is the page's masthead, not
-        # decoration inside a column. Left where the reader put it - a CV's
-        # header is read as the top of the body column - it can only be as
-        # wide as that column, so the full-bleed band came back as an inset
-        # box beside the sidebar. Hoisting the run it covers to the front of
-        # the page puts it above the columns, which is where the source drew
-        # it and the only place it can span both.
-        if banner.bbox.width >= page.width * BANNER_PAGE_SPAN:
-            blocks = _hoist(blocks, covered)
 
     if art.panels:
         # The panel backs whichever column it overlaps. Its own rectangle is
@@ -1597,7 +1351,6 @@ def _render_page(blocks: list[DocBlock], rtl: bool, base: float,
     # puts the first column on the right without any of this knowing about it.
     columns_open = False
     banner_open = False
-    banner_text_open = False
 
     for block in blocks:
         if block.column_start:
@@ -1616,16 +1369,6 @@ def _render_page(blocks: list[DocBlock], rtl: bool, base: float,
             close_list()
             out.append(_open_banner(block.banner_start))
             banner_open = True
-            banner_text_open = False
-
-        # Inside a banner the picture is a direct child - it is the thing the
-        # text sits beside - and everything else goes in one column next to it.
-        if banner_open and block.kind != "image" and not banner_text_open:
-            out.append('<div class="banner-text">')
-            banner_text_open = True
-        elif banner_open and block.kind == "image" and banner_text_open:
-            out.append("</div>")
-            banner_text_open = False
 
         # Where this block's own output begins, so a frame wraps exactly what
         # the block produced - taken after any column tag, which belongs to
@@ -1704,9 +1447,6 @@ def _render_page(blocks: list[DocBlock], rtl: bool, base: float,
 
         if block.banner_end and banner_open:
             close_list()
-            if banner_text_open:
-                out.append("</div>")
-                banner_text_open = False
             out.append("</div>")
             banner_open = False
 
@@ -1716,8 +1456,6 @@ def _render_page(blocks: list[DocBlock], rtl: bool, base: float,
 
     close_list()
     if banner_open:
-        if banner_text_open:
-            out.append("</div>")
         out.append("</div>")
     if columns_open:
         out.append("</div>")
@@ -1754,9 +1492,8 @@ def render_html_to_pdf(html_text: str, output_path: str,
                     print_background=True,
                     width=f"{page_size.width / 72.0:.2f}in",
                     height=f"{page_size.height / 72.0:.2f}in",
-                    # The margins come from the stylesheet's `@page` rule,
-                    # which is the box that repeats on every printed page.
-                    prefer_css_page_size=True,
+                    margin={"top": "0.75in", "bottom": "0.75in",
+                            "left": "0.75in", "right": "0.75in"},
                 )
             finally:
                 browser.close()
@@ -1826,57 +1563,6 @@ def _translate_blocks(pages: list[list[DocBlock]], direction: str,
         fragment.translated = translated
     for (block, r, c), translated in zip(cells, results[len(targets):]):
         block.rows[r][c] = translated
-
-
-# How far the page may be tightened to hold the source's length, and in what
-# steps. Below this the rebuild is smaller than the source in a way a reader
-# would notice, which is worse than an extra sheet.
-FIT_MIN = 0.86
-FIT_STEP = 0.04
-
-
-def _fit_to_source_pages(pages, direction: str, page_size: BBox, qa: QAReport,
-                         output_path: str, source_pages: int) -> None:
-    """Render, and tighten the page if the rebuild spilled past the source.
-
-    A translation that grows needs the room, and this does not try to deny it
-    one: the reflow is what stops a grown paragraph overlapping the text below
-    it. What it corrects is the *other* reason a page count grows - that the
-    rebuild sets the document a little larger and looser than its source, so a
-    page that was already full spills a few lines onto a sheet of their own.
-
-    The coordinate path has always done this per box, shrinking a string until
-    it fits. Here it is done once for the document, so the type stays even.
-    Each attempt is a whole render, so the steps are coarse and the floor is
-    close: this is for the page that just overran, not for cramming a document
-    onto half its length.
-    """
-    fit = 1.0
-    best_pages = None
-    while True:
-        html_text = build_html(pages, direction, page_size, qa, fit=fit)
-        render_html_to_pdf(html_text, output_path, page_size)
-        try:
-            with fitz.open(output_path) as pdf:
-                produced = pdf.page_count
-        except Exception:
-            return
-        if best_pages is None:
-            best_pages = produced
-        if produced <= source_pages or fit <= FIT_MIN:
-            break
-        fit = round(fit - FIT_STEP, 4)
-
-    if fit < 1.0 and produced <= source_pages:
-        qa.add(
-            "layout_review",
-            "info",
-            f"The rebuilt text was set {round((1 - fit) * 100)}% tighter so "
-            f"the document still fits its original {source_pages} page(s); "
-            f"without it the translation ran to {best_pages}.",
-            source_pages=source_pages,
-            fit=fit,
-        )
 
 
 def _check_pagination(source_pages: int, output_path: str,
@@ -2012,7 +1698,6 @@ def run_html_pipeline(doc: Document, output_path: str, direction: str,
         for page in doc.pages:
             try:
                 _drop_buried_duplicates(page, qa)
-                _consume_pip_images(page)
                 blocks = read(page, qa, source[page.number])
                 # Before translation, so the artwork is matched against the
                 # source's own words rather than against a translation.
@@ -2036,8 +1721,8 @@ def run_html_pipeline(doc: Document, output_path: str, direction: str,
 
     first = doc.pages[0]
     page_size = BBox(0, 0, first.width, first.height)
-    _fit_to_source_pages(pages, direction, page_size, qa, output_path,
-                         len(doc.pages))
+    html_text = build_html(pages, direction, page_size, qa)
+    render_html_to_pdf(html_text, output_path, page_size)
     _check_pagination(len(doc.pages), output_path, qa)
 
     qa.add(

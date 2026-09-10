@@ -54,54 +54,6 @@ def clean_translation(text: str) -> str:
     return out
 
 
-# A heading a template set with letter-spacing extracts as "D E T A I L S":
-# the tracking is real spaces between the glyphs, not a style the file records.
-# Sent on as-is it is translated letter by letter, and in Arabic the injected
-# spaces are worse than cosmetic - they break the cursive join, so the word
-# renders as a row of disconnected letterforms. The run is closed up before
-# translation, which is the only point where the damage can still be undone.
-#
-# The test is deliberately narrow. A run must be at least this many
-# single-character tokens in a row before it is read as tracking, so ordinary
-# prose - "a", "I", initials in "J. R. R. Tolkien" - is never touched.
-_TRACKED_MIN_RUN = 4
-# Tracking separates the letters of one word by a single space and its words by
-# a wider gap, so a run is matched only across single spaces. That keeps the
-# word break in "E M P L O Y M E N T  H I S T O R Y" intact - each word closes
-# up on its own - instead of fusing the two into one.
-_TRACKED_RE = re.compile(
-    r"(?<!\S)((?:[^\W\d_] ){%d,}[^\W\d_])(?!\S)" % (_TRACKED_MIN_RUN - 1)
-)
-
-
-def _untrack(text: str) -> str:
-    """Close up a run of letter-spaced characters into a word.
-
-    "D E T A I L S" -> "DETAILS". Runs of two or fewer are left alone, and a
-    tracked run inside a longer line is closed without disturbing the rest of
-    it, so "E M P L O Y M E N T  H I S T O R Y" becomes two words rather than
-    one. Text with no such run is returned unchanged.
-    """
-    if not text or text.count(" ") < _TRACKED_MIN_RUN - 1:
-        return text
-
-    def close(match: "re.Match[str]") -> str:
-        run = match.group(1)
-        letters = run.split()
-        # Tracking is set in one case throughout. Mixed case is a genuine run
-        # of short words, not a spaced-out word.
-        if any(c.isupper() for c in run) and any(c.islower() for c in run):
-            return run
-        return "".join(letters)
-
-    out = _TRACKED_RE.sub(close, text)
-    if out == text:
-        return text
-    # The wider gap that separated two tracked words is now an ordinary double
-    # space between them, so it is closed to one.
-    return re.sub(r" {2,}", " ", out)
-
-
 def _is_translatable(text: str, direction: Optional[str] = None) -> bool:
     """Whether a segment should be sent to the translator.
 
@@ -458,11 +410,6 @@ def translate_batch(
     """
     if direction not in DIRECTION_LABELS:
         raise ValueError(f"Unknown direction '{direction}'.")
-
-    # Letter-spaced runs are closed up before anything else looks at the text.
-    # A tracked heading is otherwise translated character by character, and in
-    # Arabic the spaces between those characters break the cursive join.
-    texts = [_untrack(t) for t in texts]
 
     results = list(texts)
     indices = [i for i, t in enumerate(texts) if _is_translatable(t, direction)]
